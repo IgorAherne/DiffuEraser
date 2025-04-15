@@ -213,6 +213,11 @@ class DiffuEraser:
             unet=self.unet_main,
             brushnet=self.brushnet
         ).to(self.device, torch.float16)
+        try:
+            self.pipeline.enable_model_cpu_offload()
+            print("--- Enabled Model CPU Offload ---")
+        except AttributeError:
+             print("--- Model CPU Offload not directly supported by this pipeline version/structure ---")
         self.pipeline.scheduler = UniPCMultistepScheduler.from_config(self.pipeline.scheduler.config)
         self.pipeline.set_progress_bar_config(disable=True)
 

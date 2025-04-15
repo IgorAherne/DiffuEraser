@@ -4,8 +4,7 @@
     <SchemaVersion>2.0</SchemaVersion>
     <ProjectGuid>6325907b-c732-431c-b653-b76ee94bed80</ProjectGuid>
     <ProjectHome>.</ProjectHome>
-    <StartupFile>
-    </StartupFile>
+    <StartupFile>run_diffueraser.py</StartupFile>
     <SearchPath>
     </SearchPath>
     <WorkingDirectory>.</WorkingDirectory>
@@ -689,6 +688,8 @@
     <Compile Include="diffueraser\pipeline_diffueraser.py" />
     <Compile Include="diffueraser\pipeline_diffueraser_stage1.py" />
     <Compile Include="diffueraser\pipeline_diffueraser_stage2.py" />
+    <Compile Include="eval_DiffuEraser_stage1.py" />
+    <Compile Include="eval_DiffuEraser_stage2.py" />
     <Compile Include="libs\brushnet_CA.py" />
     <Compile Include="libs\transformer_temporal.py" />
     <Compile Include="libs\unet_2d_blocks.py" />
@@ -738,6 +739,11 @@
     <Compile Include="propainter\utils\file_client.py" />
     <Compile Include="propainter\utils\flow_util.py" />
     <Compile Include="propainter\utils\img_util.py" />
+    <Compile Include="run_diffueraser.py" />
+    <Compile Include="save_checkpoint_stage1.py" />
+    <Compile Include="save_checkpoint_stage2.py" />
+    <Compile Include="train_DiffuEraser_stage1.py" />
+    <Compile Include="train_DiffuEraser_stage2.py" />
   </ItemGroup>
   <ItemGroup>
     <Interpreter Include="venv\">
