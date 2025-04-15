@@ -294,8 +294,8 @@ class DiffuEraser:
         except (AttributeError, NotImplementedError):
             print("--- Warning: Model CPU Offload not available/implemented ---")
         try:
-            self.pipeline.enable_attention_slicing()
-            optimizations_applied.append("Attention Slicing")
+            self.pipeline.enable_attention_slicing("max")
+            optimizations_applied.append("Max Attention Slicing")
         except (AttributeError, NotImplementedError):
             print("--- Warning: Attention Slicing not available/implemented ---")
         try:
