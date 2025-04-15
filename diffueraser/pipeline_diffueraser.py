@@ -1328,22 +1328,31 @@ class StableDiffusionDiffuEraserPipeline(
             self.brushnet.to("cpu")
             torch.cuda.empty_cache()
 
-        if  output_type == "latent":
-            image = latents
-            has_nsfw_concept = None
-            return DiffuEraserPipelineOutput(frames=image, nsfw_content_detected=has_nsfw_concept)
+        if output_type == "latent":
+            # No need to decode VAE, return the computed latents directly
+            # Assign the final latents tensor to the 'latents' field of the output object.
+            # Set 'frames' to None as we are not decoding.
+            print("--- Returning latents directly (output_type='latent') ---") # Optional: Add log
+            return DiffuEraserPipelineOutput(frames=None, latents=latents) # <<< CORRECTED RETURN
 
-        video_tensor = self.decode_latents(latents, weight_dtype=prompt_embeds.dtype)
+        # --- Code for output_type != "latent" ---
+        print(f"--- Decoding final latents to output_type='{output_type}' ---") # Optional: Add log
+        video_tensor = self.decode_latents(latents, weight_dtype=prompt_embeds.dtype) # VAE Decode happens here
 
         if output_type == "pt":
             video = video_tensor
         else:
+            # Ensure postprocess handles pt input correctly
             video = self.image_processor.postprocess(video_tensor, output_type=output_type)
 
-        # Offload all models
+        # Offload all models if needed (maybe_free_model_hooks likely handles offloaded models)
         self.maybe_free_model_hooks()
 
         if not return_dict:
-            return (video, has_nsfw_concept)
+            # Original code had 'has_nsfw_concept' here, but safety checker is likely off.
+            # Return only the video frames/tensor in a tuple.
+            return (video,)
 
+        # Return the standard output object for non-latent types
+        print("--- Returning decoded frames and final latents ---") # Optional: Add log
         return DiffuEraserPipelineOutput(frames=video, latents=latents)
