@@ -179,181 +179,252 @@ def read_video(validation_image, video_length, nframes, max_img_size):
 class DiffuEraser:
     def __init__(
             self, device, base_model_path, vae_path, diffueraser_path, revision=None,
-            ckpt="Normal CFG 4-Step", mode="sd15", loaded=None): # `loaded` tracks if PCM loaded to avoid reloading
+            ckpt="Normal CFG 4-Step", mode="sd15", loaded=None):
         self.device = device
-        print(f"--- Initializing DiffuEraser on device: {self.device} ---")
 
-        print("--- Attempting to configure PyTorch SDP backends ---")
-        if torch.cuda.is_available():
-            torch_version = torch.__version__
-            print(f"PyTorch CUDA available. Torch version: {torch_version}")
-            try:
-                # Try importing flash_attn to confirm installation and get version
-                import flash_attn
-                flash_attn_installed = True
-                flash_version = getattr(flash_attn, '__version__', 'N/A')
-                print(f"Flash Attention package imported successfully (Version: {flash_version}).")
-            except ImportError:
-                flash_attn_installed = False
-                print("Flash Attention package not found or import failed.")
-
-            # Enable Flash SDP backend (supported in PyTorch >= 2.0)
-            # This tells PyTorch's SDPA dispatcher to prioritize flash-attn if available
-            if hasattr(torch.backends.cuda, "enable_flash_sdp"):
-                try:
-                    # The boolean argument enables/disables it
-                    torch.backends.cuda.enable_flash_sdp(True)
-                    print("[INFO] Enabled PyTorch Flash SDP backend.")
-                except Exception as e:
-                    # Catch potential errors during enabling
-                    print(f"[WARN] Could not enable PyTorch Flash SDP backend: {e}")
-            else:
-                # Log if the attribute doesn't exist (older PyTorch version)
-                print("[INFO] torch.backends.cuda.enable_flash_sdp not available (likely PyTorch < 2.0).")
-
-            # Enable Memory Efficient SDP backend
-            # This is another dispatcher setting that can use flash-attn, xformers, or other optimized kernels
-            if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
-                try:
-                    torch.backends.cuda.enable_mem_efficient_sdp(True)
-                    print("[INFO] Enabled PyTorch Memory-Efficient SDP backend.")
-                except Exception as e:
-                    print(f"[WARN] Could not enable PyTorch Memory-Efficient SDP backend: {e}")
-            else:
-                print("[INFO] torch.backends.cuda.enable_mem_efficient_sdp not available.")
-        else:
-            # Log if CUDA is not detected
-            print("[WARN] CUDA not available, cannot enable GPU SDP backends.")
-        print("--- SDP backend configuration attempt finished ---")
-        # <<< --- END: Add Flash Attention / SDPA Backend Encouragement --- >>>
-
-        print(f"--- Using base: {base_model_path}, VAE: {vae_path}, DiffuEraser weights: {diffueraser_path} ---")
-        print(f"--- PCM Checkpoint mode: {ckpt}, SD mode: {mode} ---")
-
-        # 1. Load individual components
-        print("--- Loading VAE ---")
-        vae = AutoencoderKL.from_pretrained(vae_path, revision=revision)
-        self.vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
-        self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor, do_convert_rgb=True)
-
-        print("--- Loading Tokenizer ---")
-        tokenizer = AutoTokenizer.from_pretrained(
-                    base_model_path, subfolder="tokenizer", revision=revision, use_fast=False,
-                )
-        print("--- Loading Text Encoder ---")
-        text_encoder_cls = import_model_class_from_model_name_or_path(base_model_path, revision)
-        text_encoder = text_encoder_cls.from_pretrained(
-                base_model_path, subfolder="text_encoder", revision=revision
+        ## load model
+        self.vae = AutoencoderKL.from_pretrained(vae_path)
+        self.noise_scheduler = DDPMScheduler.from_pretrained(base_model_path, 
+                subfolder="scheduler",
+                prediction_type="v_prediction",
+                timestep_spacing="trailing",
+                rescale_betas_zero_snr=True
             )
-        print("--- Loading BrushNet ---")
-        brushnet = BrushNetModel.from_pretrained(diffueraser_path, subfolder="brushnet")
-        print("--- Loading UNet Main (Motion Model) ---")
-        unet_main = UNetMotionModel.from_pretrained(
+        self.tokenizer = AutoTokenizer.from_pretrained(
+                    base_model_path,
+                    subfolder="tokenizer",
+                    use_fast=False,
+                )
+        text_encoder_cls = import_model_class_from_model_name_or_path(base_model_path,revision)
+        self.text_encoder = text_encoder_cls.from_pretrained(
+                base_model_path, subfolder="text_encoder"
+            )
+        self.brushnet = BrushNetModel.from_pretrained(diffueraser_path, subfolder="brushnet")
+        self.unet_main = UNetMotionModel.from_pretrained(
             diffueraser_path, subfolder="unet_main",
         )
-        # 2. Configure and initialize the default scheduler (UniPC)
-        print("--- Configuring Default Scheduler (UniPCMultistepScheduler) ---")
-        scheduler_config_path = os.path.join(base_model_path, "scheduler")
-        try:
-             # Load config dict from base model scheduler settings
-             scheduler_config_dict = UniPCMultistepScheduler.load_config(scheduler_config_path, revision=revision)
-             print(f"--- Loaded scheduler config from: {scheduler_config_path} ---")
-             # Initialize UniPC using the loaded config
-             default_scheduler = UniPCMultistepScheduler.from_config(scheduler_config_dict)
-             # Initialize the noise scheduler instance (used in forward)
-             self.noise_scheduler = UniPCMultistepScheduler.from_config(scheduler_config_dict)
-             print(f"--- Initialized default UniPCMultistepScheduler and noise_scheduler ---")
-        except Exception as e:
-             print(f"Error loading scheduler config from {scheduler_config_path}: {e}. Cannot continue.")
-             raise e
-        # 3. Create the main pipeline instance, passing components
-        print("--- Creating StableDiffusionDiffuEraserPipeline ---")
-        self.pipeline = StableDiffusionDiffuEraserPipeline.from_pretrained(
-            base_model_path, # Base path often needed for pipeline config even with components provided
-            vae=vae,
-            text_encoder=text_encoder,
-            tokenizer=tokenizer,
-            unet=unet_main,
-            brushnet=brushnet,
-            scheduler=default_scheduler, # Pass the initialized default scheduler
-            safety_checker=None,
-            feature_extractor=None,
-            requires_safety_checker=False,
-            revision=revision,
-        )
-        # 4. Move pipeline to device and set dtype
-        print(f"--- Moving pipeline to {self.device} with dtype torch.float16 ---")
-        self.pipeline.to(self.device, dtype=torch.float16)
-        self.pipeline.set_progress_bar_config(disable=True)
 
-        # 5. Enable optimizations (place after .to(device))
-        optimizations_applied = []
+        ## set pipeline
+        self.pipeline = StableDiffusionDiffuEraserPipeline.from_pretrained(
+            base_model_path,
+            vae=self.vae,
+            text_encoder=self.text_encoder,
+            tokenizer=self.tokenizer,
+            unet=self.unet_main,
+            brushnet=self.brushnet
+        ).to(self.device, torch.float16)
         try:
             self.pipeline.enable_model_cpu_offload()
-            optimizations_applied.append("Model CPU Offload")
-        except (AttributeError, NotImplementedError):
-            print("--- Warning: Model CPU Offload not available/implemented ---")
-        try:
-            self.pipeline.enable_attention_slicing("max")
-            optimizations_applied.append("Max Attention Slicing")
-        except (AttributeError, NotImplementedError):
-            print("--- Warning: Attention Slicing not available/implemented ---")
-        try:
-            self.pipeline.unet.enable_gradient_checkpointing()
-            optimizations_applied.append("UNet Gradient Checkpointing")
-        except (AttributeError, NotImplementedError):
-            print("--- Warning: UNet Gradient Checkpointing not available/implemented ---")
-        try:
-            self.pipeline.brushnet.enable_gradient_checkpointing()
-            optimizations_applied.append("BrushNet Gradient Checkpointing")
-        except (AttributeError, NotImplementedError):
-             print("--- Warning: BrushNet Gradient Checkpointing not available/implemented ---")
-        print(f"--- Enabled Optimizations: {', '.join(optimizations_applied) if optimizations_applied else 'None'} ---")
+            print("--- Enabled Model CPU Offload ---")
+        except AttributeError:
+             print("--- Model CPU Offload not directly supported by this pipeline version/structure ---")
+        self.pipeline.scheduler = UniPCMultistepScheduler.from_config(self.pipeline.scheduler.config)
+        self.pipeline.set_progress_bar_config(disable=True)
 
-        # 6. Handle PCM weights loading and potential scheduler override
+        self.noise_scheduler = UniPCMultistepScheduler.from_config(self.pipeline.scheduler.config)
+        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
+        self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor, do_convert_rgb=True)
+
+        ## use PCM
         self.ckpt = ckpt
-        self.num_inference_steps = 20 # Default steps
-        self.guidance_scale = 0.0    # Default guidance
+        PCM_ckpts = checkpoints[ckpt][0].format(mode)
+        self.guidance_scale = checkpoints[ckpt][2]
+        if loaded != (ckpt + mode):
+            self.pipeline.load_lora_weights(
+                "weights/PCM_Weights", weight_name=PCM_ckpts, subfolder=mode
+            )
+            loaded = ckpt + mode
 
-        if ckpt in checkpoints:
-            pcm_filename = checkpoints[ckpt][0].format(mode)
-            pcm_path = os.path.join("weights/PCM_Weights", pcm_filename)
-            self.guidance_scale = checkpoints[ckpt][2] # Use PCM guidance
-            num_inf_steps_pcm = checkpoints[ckpt][1]   # Use PCM steps
-
-            print(f"--- Preparing to load PCM LoRA: {pcm_filename} ---")
-            if loaded != (ckpt + mode):
-                if os.path.exists(pcm_path):
-                    print(f"--- Loading PCM LoRA weights from: {pcm_path} ---")
-                    # Load LoRA weights into the pipeline
-                    self.pipeline.load_lora_weights(
-                         os.path.dirname(pcm_path),
-                         weight_name=os.path.basename(pcm_path)
-                    )
-                    # Update state tracker if you have one passed via `loaded` parameter
-                    # loaded = ckpt + mode # This assignment would need `loaded` to be managed externally or made self.loaded
-                else:
-                     print(f"Error: PCM weight file not found at {pcm_path}. Skipping LoRA load.")
-
-            # Override scheduler based on PCM type AFTER pipeline is created and LoRA loaded
-            current_scheduler_config_dict = self.pipeline.scheduler.config
             if ckpt == "LCM-Like LoRA":
-                print(f"--- Overriding Scheduler: Using LCMScheduler ---")
-                self.pipeline.scheduler = LCMScheduler.from_config(current_scheduler_config_dict)
-                self.noise_scheduler = LCMScheduler.from_config(current_scheduler_config_dict) # Sync noise scheduler
-            elif "Step" in ckpt:
-                print(f"--- Overriding Scheduler: Using TCDScheduler ---")
-                self.pipeline.scheduler = TCDScheduler.from_config(current_scheduler_config_dict)
-                self.noise_scheduler = TCDScheduler.from_config(current_scheduler_config_dict) # Sync noise scheduler
-            # else: Keep the default UniPC scheduler
+                self.pipeline.scheduler = LCMScheduler()
+            else:
+                self.pipeline.scheduler = TCDScheduler(
+                    num_train_timesteps=1000,
+                    beta_start=0.00085,
+                    beta_end=0.012,
+                    beta_schedule="scaled_linear",
+                    timestep_spacing="trailing",
+                )
+        self.num_inference_steps = checkpoints[ckpt][1]
+        self.guidance_scale = 0
 
-            self.num_inference_steps = num_inf_steps_pcm # Set steps based on PCM config
-            print(f"--- Using PCM config: guidance scale={self.guidance_scale}, inference steps={self.num_inference_steps} ---")
-        else:
-             print(f"Warning: PCM checkpoint '{ckpt}' not found. Using default guidance={self.guidance_scale}, steps={self.num_inference_steps}.")
+    # def __init__(
+    #         self, device, base_model_path, vae_path, diffueraser_path, revision=None,
+    #         ckpt="Normal CFG 4-Step", mode="sd15", loaded=None): # `loaded` tracks if PCM loaded to avoid reloading
+    #     self.device = device
+    #     print(f"--- Initializing DiffuEraser on device: {self.device} ---")
 
-        print(f"--- Final Active Pipeline Scheduler: {type(self.pipeline.scheduler).__name__} ---")
-        print(f"--- DiffuEraser Initialization Complete ---")
+    #     print("--- Attempting to configure PyTorch SDP backends ---")
+    #     if torch.cuda.is_available():
+    #         torch_version = torch.__version__
+    #         print(f"PyTorch CUDA available. Torch version: {torch_version}")
+    #         # try:
+    #         #     # Try importing flash_attn to confirm installation and get version
+    #         #     import flash_attn
+    #         #     flash_attn_installed = True
+    #         #     flash_version = getattr(flash_attn, '__version__', 'N/A')
+    #         #     print(f"Flash Attention package imported successfully (Version: {flash_version}).")
+    #         # except ImportError:
+    #         #     flash_attn_installed = False
+    #         #     print("Flash Attention package not found or import failed.")
+
+    #         # # Enable Flash SDP backend (supported in PyTorch >= 2.0)
+    #         # # This tells PyTorch's SDPA dispatcher to prioritize flash-attn if available
+    #         # if hasattr(torch.backends.cuda, "enable_flash_sdp"):
+    #         #     try:
+    #         #         # The boolean argument enables/disables it
+    #         #         torch.backends.cuda.enable_flash_sdp(True)
+    #         #         print("[INFO] Enabled PyTorch Flash SDP backend.")
+    #         #     except Exception as e:
+    #         #         # Catch potential errors during enabling
+    #         #         print(f"[WARN] Could not enable PyTorch Flash SDP backend: {e}")
+    #         # else:
+    #         #     # Log if the attribute doesn't exist (older PyTorch version)
+    #         #     print("[INFO] torch.backends.cuda.enable_flash_sdp not available (likely PyTorch < 2.0).")
+
+    #         # # Enable Memory Efficient SDP backend
+    #         # # This is another dispatcher setting that can use flash-attn, xformers, or other optimized kernels
+    #         # if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
+    #         #     try:
+    #         #         torch.backends.cuda.enable_mem_efficient_sdp(True)
+    #         #         print("[INFO] Enabled PyTorch Memory-Efficient SDP backend.")
+    #         #     except Exception as e:
+    #         #         print(f"[WARN] Could not enable PyTorch Memory-Efficient SDP backend: {e}")
+    #         # else:
+    #         #     print("[INFO] torch.backends.cuda.enable_mem_efficient_sdp not available.")
+    #     else:
+    #         # Log if CUDA is not detected
+    #         print("[WARN] CUDA not available, cannot enable GPU SDP backends.")
+    #     print("--- SDP backend configuration attempt finished ---")
+    #     # <<< --- END: Add Flash Attention / SDPA Backend Encouragement --- >>>
+
+    #     print(f"--- Using base: {base_model_path}, VAE: {vae_path}, DiffuEraser weights: {diffueraser_path} ---")
+    #     print(f"--- PCM Checkpoint mode: {ckpt}, SD mode: {mode} ---")
+
+    #     # 1. Load individual components
+    #     print("--- Loading VAE ---")
+    #     vae = AutoencoderKL.from_pretrained(vae_path, revision=revision)
+    #     self.vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
+    #     self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor, do_convert_rgb=True)
+
+    #     print("--- Loading Tokenizer ---")
+    #     tokenizer = AutoTokenizer.from_pretrained(
+    #                 base_model_path, subfolder="tokenizer", revision=revision, use_fast=False,
+    #             )
+    #     print("--- Loading Text Encoder ---")
+    #     text_encoder_cls = import_model_class_from_model_name_or_path(base_model_path, revision)
+    #     text_encoder = text_encoder_cls.from_pretrained(
+    #             base_model_path, subfolder="text_encoder", revision=revision
+    #         )
+    #     print("--- Loading BrushNet ---")
+    #     brushnet = BrushNetModel.from_pretrained(diffueraser_path, subfolder="brushnet")
+    #     print("--- Loading UNet Main (Motion Model) ---")
+    #     unet_main = UNetMotionModel.from_pretrained(
+    #         diffueraser_path, subfolder="unet_main",
+    #     )
+    #     # 2. Configure and initialize the default scheduler (UniPC)
+    #     print("--- Configuring Default Scheduler (UniPCMultistepScheduler) ---")
+    #     scheduler_config_path = os.path.join(base_model_path, "scheduler")
+    #     try:
+    #          # Load config dict from base model scheduler settings
+    #          scheduler_config_dict = UniPCMultistepScheduler.load_config(scheduler_config_path, revision=revision)
+    #          print(f"--- Loaded scheduler config from: {scheduler_config_path} ---")
+    #          # Initialize UniPC using the loaded config
+    #          default_scheduler = UniPCMultistepScheduler.from_config(scheduler_config_dict)
+    #          # Initialize the noise scheduler instance (used in forward)
+    #          self.noise_scheduler = UniPCMultistepScheduler.from_config(scheduler_config_dict)
+    #          print(f"--- Initialized default UniPCMultistepScheduler and noise_scheduler ---")
+    #     except Exception as e:
+    #          print(f"Error loading scheduler config from {scheduler_config_path}: {e}. Cannot continue.")
+    #          raise e
+    #     # 3. Create the main pipeline instance, passing components
+    #     print("--- Creating StableDiffusionDiffuEraserPipeline ---")
+    #     self.pipeline = StableDiffusionDiffuEraserPipeline.from_pretrained(
+    #         base_model_path, # Base path often needed for pipeline config even with components provided
+    #         vae=vae,
+    #         text_encoder=text_encoder,
+    #         tokenizer=tokenizer,
+    #         unet=unet_main,
+    #         brushnet=brushnet,
+    #         scheduler=default_scheduler, # Pass the initialized default scheduler
+    #         safety_checker=None,
+    #         feature_extractor=None,
+    #         requires_safety_checker=False,
+    #         revision=revision,
+    #     )
+    #     # 4. Move pipeline to device and set dtype
+    #     print(f"--- Moving pipeline to {self.device} with dtype torch.float16 ---")
+    #     self.pipeline.to(self.device, dtype=torch.float16)
+    #     self.pipeline.set_progress_bar_config(disable=True)
+
+    #     # 5. Enable optimizations (place after .to(device))
+    #     optimizations_applied = []
+    #     try:
+    #         self.pipeline.enable_model_cpu_offload()
+    #         optimizations_applied.append("Model CPU Offload")
+    #     except (AttributeError, NotImplementedError):
+    #         print("--- Warning: Model CPU Offload not available/implemented ---")
+    #     try:
+    #         self.pipeline.enable_attention_slicing("max")
+    #         optimizations_applied.append("Max Attention Slicing")
+    #     except (AttributeError, NotImplementedError):
+    #         print("--- Warning: Attention Slicing not available/implemented ---")
+    #     try:
+    #         self.pipeline.unet.enable_gradient_checkpointing()
+    #         optimizations_applied.append("UNet Gradient Checkpointing")
+    #     except (AttributeError, NotImplementedError):
+    #         print("--- Warning: UNet Gradient Checkpointing not available/implemented ---")
+    #     try:
+    #         self.pipeline.brushnet.enable_gradient_checkpointing()
+    #         optimizations_applied.append("BrushNet Gradient Checkpointing")
+    #     except (AttributeError, NotImplementedError):
+    #          print("--- Warning: BrushNet Gradient Checkpointing not available/implemented ---")
+    #     print(f"--- Enabled Optimizations: {', '.join(optimizations_applied) if optimizations_applied else 'None'} ---")
+
+    #     # 6. Handle PCM weights loading and potential scheduler override
+    #     self.ckpt = ckpt
+    #     self.num_inference_steps = 20 # Default steps
+    #     self.guidance_scale = 0.0    # Default guidance
+
+    #     if ckpt in checkpoints:
+    #         pcm_filename = checkpoints[ckpt][0].format(mode)
+    #         pcm_path = os.path.join("weights/PCM_Weights", pcm_filename)
+    #         self.guidance_scale = checkpoints[ckpt][2] # Use PCM guidance
+    #         num_inf_steps_pcm = checkpoints[ckpt][1]   # Use PCM steps
+
+    #         print(f"--- Preparing to load PCM LoRA: {pcm_filename} ---")
+    #         if loaded != (ckpt + mode):
+    #             if os.path.exists(pcm_path):
+    #                 print(f"--- Loading PCM LoRA weights from: {pcm_path} ---")
+    #                 # Load LoRA weights into the pipeline
+    #                 self.pipeline.load_lora_weights(
+    #                      os.path.dirname(pcm_path),
+    #                      weight_name=os.path.basename(pcm_path)
+    #                 )
+    #                 # Update state tracker if you have one passed via `loaded` parameter
+    #                 # loaded = ckpt + mode # This assignment would need `loaded` to be managed externally or made self.loaded
+    #             else:
+    #                  print(f"Error: PCM weight file not found at {pcm_path}. Skipping LoRA load.")
+
+    #         # Override scheduler based on PCM type AFTER pipeline is created and LoRA loaded
+    #         current_scheduler_config_dict = self.pipeline.scheduler.config
+    #         if ckpt == "LCM-Like LoRA":
+    #             print(f"--- Overriding Scheduler: Using LCMScheduler ---")
+    #             self.pipeline.scheduler = LCMScheduler.from_config(current_scheduler_config_dict)
+    #             self.noise_scheduler = LCMScheduler.from_config(current_scheduler_config_dict) # Sync noise scheduler
+    #         elif "Step" in ckpt:
+    #             print(f"--- Overriding Scheduler: Using TCDScheduler ---")
+    #             self.pipeline.scheduler = TCDScheduler.from_config(current_scheduler_config_dict)
+    #             self.noise_scheduler = TCDScheduler.from_config(current_scheduler_config_dict) # Sync noise scheduler
+    #         # else: Keep the default UniPC scheduler
+
+    #         self.num_inference_steps = num_inf_steps_pcm # Set steps based on PCM config
+    #         print(f"--- Using PCM config: guidance scale={self.guidance_scale}, inference steps={self.num_inference_steps} ---")
+    #     else:
+    #          print(f"Warning: PCM checkpoint '{ckpt}' not found. Using default guidance={self.guidance_scale}, steps={self.num_inference_steps}.")
+
+    #     print(f"--- Final Active Pipeline Scheduler: {type(self.pipeline.scheduler).__name__} ---")
+    #     print(f"--- DiffuEraser Initialization Complete ---")
 
 
     def forward(self, validation_image, validation_mask, priori, output_path,
