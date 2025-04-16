@@ -1092,26 +1092,32 @@ class StableDiffusionDiffuEraserPipeline(
                 do_classifier_free_guidance=self.do_classifier_free_guidance,
                 guess_mode=guess_mode,
             )
-            original_masks = self.prepare_image(
-                images=masks,
+            original_masks_prepared = self.prepare_image( # Use a distinct variable name initially
+                images=masks, # Pass the original masks list here
                 width=width,
                 height=height,
                 batch_size=batch_size * num_images_per_prompt,
                 num_images_per_prompt=num_images_per_prompt,
                 device=device,
-                dtype=brushnet.dtype,
-                do_classifier_free_guidance=self.do_classifier_free_guidance,
-                guess_mode=guess_mode,
+                dtype=torch.float32, # Prepare masks in float32 for consistent thresholding
+                do_classifier_free_guidance=self.do_classifier_free_guidance, # Should likely be False for masks
+                guess_mode=guess_mode, # Should likely be False for masks
             )
-            original_masks_new = []
-            for original_mask in original_masks:
-                original_mask=(original_mask.sum(1)[:,None,:,:] < 0).to(images[0].dtype) 
-                original_masks_new.append(original_mask)
-            original_masks = original_masks_new
+            original_masks_processed = []
+            for mask_tensor in original_masks_prepared:
+                # Assuming prepare_image outputs range [0, 1] or similar non-negative
+                # Convert to grayscale and threshold to get binary mask [1, 1, H, W]
+                # Take the mean across channels (simple grayscale conversion)
+                mask_gray = mask_tensor.mean(dim=1, keepdim=True)
+                # Threshold: mask is typically white (1) where inpainting should occur
+                mask_binary = (mask_gray > 0.5).to(brushnet.dtype) # Threshold at 0.5 and convert to brushnet's dtype
+                original_masks_processed.append(mask_binary)
+            # Rename for consistency with the rest of the code downstream
+            original_masks = original_masks_processed # This is now a list of [1, 1, H, W] tensors
             
             height, width = images[0].shape[-2:]
         else:
-            assert False
+            assert False# Should not happen if brushnet is correctly passe
 
         # 5. Prepare timesteps
         timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, num_inference_steps, device, timesteps)
