@@ -588,49 +588,52 @@ class DiffuEraser:
 
                 # Decode latents and update original tensors
                 if latents_pre_out is not None and latents_pre_out.shape[0] == num_samples:
-                     print(f"--- Decoding {num_samples} pre-inference latents ---")
-                     # Define local decode function to handle VAE device management
-                     def decode_latents_local(lats_to_decode, dtype):
-                         vae = self.pipeline.vae
-                         original_dev = vae.device
-                         try:
-                             vae.to(self.device)
-                             lats_to_decode = 1 / vae.config.scaling_factor * lats_to_decode.to(self.device)
-                             vid = []
-                             decode_batch_size = 4 # Decode in smaller batches if needed
-                             for t_idx in range(0, lats_to_decode.shape[0], decode_batch_size):
-                                 batch_lats = lats_to_decode[t_idx : t_idx + decode_batch_size]
-                                 vid.append(vae.decode(batch_lats.to(dtype)).sample)
-                             vid = torch.concat(vid, dim=0)
-                             return vid.float().cpu() # Return to CPU
-                         finally:
-                             vae.to(original_dev) # Return VAE to original device
+                    print(f"--- Decoding {num_samples} pre-inference latents ---")
+                    # Define local decode function to handle VAE device management
+                    def decode_latents_local(lats_to_decode, dtype):
+                        vae = self.pipeline.vae
+                        original_dev = vae.device
+                        try:
+                            vae.to(self.device)
+                            lats_to_decode = 1 / vae.config.scaling_factor * lats_to_decode.to(self.device)
+                            vid = []
+                            decode_batch_size = 4 # Decode in smaller batches if needed
+                            for t_idx in range(0, lats_to_decode.shape[0], decode_batch_size):
+                                batch_lats = lats_to_decode[t_idx : t_idx + decode_batch_size]
+                                vid.append(vae.decode(batch_lats.to(dtype)).sample)
+                            vid = torch.concat(vid, dim=0)
+                            return vid.float().cpu() # Return to CPU
+                        finally:
+                            vae.to(original_dev) # Return VAE to original device
 
-                     with torch.no_grad():
-                        video_tensor_temp = decode_latents_local(latents_pre_out, dtype=torch.float16)
-                        images_pre_out = self.image_processor.postprocess(video_tensor_temp, output_type="pil") # Output PIL images
-                     del video_tensor_temp
-                     torch.cuda.empty_cache()
-                     print(f"--- Decoded pre-inference images ---")
+                    with torch.no_grad():
+                       video_tensor_temp = decode_latents_local(latents_pre_out, dtype=torch.float16)
+                       images_pre_out = self.image_processor.postprocess(video_tensor_temp, output_type="pil") # Output PIL images
+                    del video_tensor_temp
+                    torch.cuda.empty_cache()
+                    print(f"--- Decoded pre-inference images ---")
 
-                     ## Replace input frames in the main tensors with updated pre-inference results
-                     print(f"--- Updating main tensors with {len(images_pre_out)} pre-inference results ---")
-                     black_image = Image.new('L', validation_masks_input[0].size, color=0) # Mask for updated areas
-                     for i, index in enumerate(sample_index): # Loop over correct indices
-                        if i < latents_pre_out.shape[0] and index < latents.shape[0] and i < len(images_pre_out):
-                             # Update latents (move pre-inf latent back to GPU for assignment)
-                             latents[index] = latents_pre_out[i].to(self.device)
-                             # Update image inputs (use generated image)
-                             validation_images_input[index] = images_pre_out[i]
-                             resized_frames[index] = images_pre_out[i] # Update the frame buffer too
-                             # Update mask (set to black as this area is now generated)
-                             validation_masks_input[index] = black_image
+                    ## ! --- ONLY UPDATE LATENTS --- !
+                    print(f"--- Updating main latents tensor ONLY with {len(sample_index)} pre-inference results ---") # Adjusted log
+                    for i, index in enumerate(sample_index): # Loop over correct indices
+                        if i < latents_pre_out.shape[0] and index < latents.shape[0]: # Removed check for images_pre_out length
+                            # Update latents (move pre-inf latent back to GPU for assignment)
+                            latents[index] = latents_pre_out[i].to(self.device)
+
+                            # --- REMOVED THE FOLLOWING LINES ---
+                            # validation_images_input[index] = images_pre_out[i]
+                            # resized_frames[index] = images_pre_out[i]
+                            # validation_masks_input[index] = black_image
+                            # --- END REMOVAL ---
                         else:
-                             print(f"Warning: Index mismatch during pre-inference update (i={i}, index={index}). Skipping update for this index.")
-                     del images_pre_out # Free memory
-                else:
-                    print("--- Skipping pre-inference result application due to missing/mismatched latents_pre_out ---")
-                    latents_pre_out = None # Ensure it's None
+                            print(f"Warning: Index mismatch during pre-inference LATENT update (i={i}, index={index}). Skipping update for this index.")
+                    # del images_pre_out # Delete decoded images if not needed elsewhere (they aren't here)
+                    # if 'images_pre_out' in locals(): del images_pre_out # Safer deletion
+                    # torch.cuda.empty_cache() # Optional cache clearing
+
+                else: # If latents_pre_out was None or mismatch
+                     print("--- Skipping pre-inference result application due to missing/mismatched latents_pre_out ---")
+                     latents_pre_out = None # Ensure it's None
 
             else: # latents_pre was None or pipeline failed
                  print("--- Skipping pre-inference pipeline call due to sampling or other issues ---")
