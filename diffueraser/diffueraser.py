@@ -199,10 +199,8 @@ class DiffuEraser:
         self.text_encoder = text_encoder_cls.from_pretrained(
                 base_model_path, subfolder="text_encoder"
             )
-        self.brushnet = BrushNetModel.from_pretrained(diffueraser_path, subfolder="brushnet")
-        self.unet_main = UNetMotionModel.from_pretrained(
-            diffueraser_path, subfolder="unet_main",
-        )
+        self.brushnet = BrushNetModel.from_pretrained(diffueraser_path, subfolder="brushnet").to(self.device, torch.float16)
+        self.unet_main = UNetMotionModel.from_pretrained(diffueraser_path, subfolder="unet_main").to(self.device, torch.float16)
 
         ## set pipeline
         self.pipeline = StableDiffusionDiffuEraserPipeline.from_pretrained(
@@ -211,8 +209,16 @@ class DiffuEraser:
             text_encoder=self.text_encoder,
             tokenizer=self.tokenizer,
             unet=self.unet_main,
-            brushnet=self.brushnet
+            brushnet=self.brushnet,
         ).to(self.device, torch.float16)
+
+        #  Explicit Gradient Checkpointing (Optional but recommended)
+        print("--- Explicitly enabling gradient checkpointing for UNet and BrushNet ---")
+        if hasattr(self.pipeline.unet, "enable_gradient_checkpointing"):
+             self.pipeline.unet.enable_gradient_checkpointing()
+        if hasattr(self.pipeline.brushnet, "enable_gradient_checkpointing"):
+             self.pipeline.brushnet.enable_gradient_checkpointing()
+
         try:
             self.pipeline.enable_model_cpu_offload()
             print("--- Enabled Model CPU Offload ---")

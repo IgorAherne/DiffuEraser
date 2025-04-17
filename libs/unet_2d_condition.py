@@ -1181,6 +1181,15 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin,
             encoder_hidden_states=encoder_hidden_states, added_cond_kwargs=added_cond_kwargs
         )
 
+        # Ensure encoder_hidden_states is in the correct dtype (matching sample's dtype)
+        if encoder_hidden_states is not None:
+            # Handle tuple case (e.g., if process_encoder_hidden_states returned multiple tensors)
+            if isinstance(encoder_hidden_states, tuple):
+                # Assuming the main text embeddings are the first element
+                encoder_hidden_states = (encoder_hidden_states[0].to(sample.dtype), *encoder_hidden_states[1:])
+            else:
+                encoder_hidden_states = encoder_hidden_states.to(sample.dtype)
+
         # 2. pre-process
         sample = self.conv_in(sample)
 

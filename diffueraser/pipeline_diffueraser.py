@@ -1450,8 +1450,10 @@ class StableDiffusionDiffuEraserPipeline(
         if self.unet.config.time_cond_proj_dim is not None:
             # Assuming batch_size = 1 for video
             guidance_scale_tensor = torch.tensor(self.guidance_scale - 1).repeat(1)
+            target_dtype = latents.dtype
             timestep_cond = self.get_guidance_scale_embedding(
-                guidance_scale_tensor, embedding_dim=self.unet.config.time_cond_proj_dim
+                guidance_scale_tensor, embedding_dim=self.unet.config.time_cond_proj_dim,
+                dtype=target_dtype # Request float16 directly from embedding function
             ).to(device=device, dtype=latents.dtype)
 
         return (

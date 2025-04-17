@@ -775,8 +775,13 @@ class BrushNetModel(ModelMixin, ConfigMixin):
 
         # timesteps does not contain any weights and will always return f32 tensors
         # but time_embedding might actually be running in fp16. so we need to cast here.
-        # there might be better ways to encapsulate this.
-        t_emb = t_emb.to(dtype=sample.dtype)
+        # Cast t_emb to the dtype of the embedding layer's parameters
+        time_embedding_dtype = next(self.time_embedding.parameters()).dtype
+        t_emb = t_emb.to(dtype=time_embedding_dtype)
+
+        # Check/Cast for timestep_cond ---
+        if timestep_cond is not None and timestep_cond.dtype != time_embedding_dtype:
+            timestep_cond = timestep_cond.to(dtype=time_embedding_dtype)
 
         emb = self.time_embedding(t_emb, timestep_cond)
         aug_emb = None
@@ -815,9 +820,20 @@ class BrushNetModel(ModelMixin, ConfigMixin):
 
         emb = emb + aug_emb if aug_emb is not None else emb
 
+        # Ensure encoder_hidden_states is in the correct dtype for BrushNet (matching sample's dtype)
+        if encoder_hidden_states is not None:
+             # Check if it needs casting (BrushNet should be float16)
+             if encoder_hidden_states.dtype != sample.dtype:
+                 print(f"BrushNet Forward: Casting encoder_hidden_states from {encoder_hidden_states.dtype} to {sample.dtype}")
+                 encoder_hidden_states = encoder_hidden_states.to(sample.dtype)
+             # Optional: Verification Log
+             # print(f"BrushNet Forward: encoder_hidden_states dtype = {encoder_hidden_states.dtype}")
+
         # 2. pre-process
-        brushnet_cond=torch.concat([sample,brushnet_cond],1)
-        sample = self.conv_in_condition(brushnet_cond)
+        brushnet_cond_concat=torch.concat([sample,brushnet_cond],1)
+        conv_in_dtype = next(self.conv_in_condition.parameters()).dtype
+        brushnet_cond_concat = brushnet_cond_concat.to(dtype=conv_in_dtype)
+        sample = self.conv_in_condition(brushnet_cond_concat)
 
 
         # 3. down
