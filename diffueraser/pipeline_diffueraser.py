@@ -849,272 +849,6 @@ class StableDiffusionDiffuEraserPipeline(
     def num_timesteps(self):
         return self._num_timesteps
 
-    
-    # Define the helper method within the class
-    # Define the helper method within the class
-    def _process_context_step(
-        self,
-        j: int,
-        context: np.ndarray, # Or torch.Tensor depending on context_list type
-        scheduler_state: Dict,
-        current_latents_context: torch.Tensor, # Input latents SLICE for this context
-        value: torch.Tensor, # Accumulated results tensor (modified by blending/assignment)
-        count: torch.Tensor, # Accumulated counts tensor (incremented)
-        t: Union[torch.Tensor, int], # Current timestep
-        i: int, # Outer loop index (for brushnet_keep)
-        unet_device: torch.device,
-        cpu_device: torch.device,
-        original_prompt_embeds: torch.Tensor, # Embeds for UNet (potentially cfg-concatenated)
-        conditioning_latents: torch.Tensor,
-        timestep_cond: Optional[torch.Tensor],
-        brushnet_keep: List,
-        brushnet_conditioning_scale: Union[float, List[float]],
-        guess_mode: bool,
-        is_unet_compiled: bool,
-        is_brushnet_compiled: bool,
-        is_torch_higher_equal_2_1: bool,
-        extra_step_kwargs: Dict,
-        added_cond_kwargs: Optional[Dict],
-    ) -> Tuple[torch.Tensor, torch.Tensor]: # Returns updated value, count (modified in place)
-        """
-        Processes a single context window (j) within a denoising timestep (t).
-        Updates the `value` and `count` tensors based on the processing of `current_latents_context`.
-        (Keep full docstring as before)
-        """
-        # Restore scheduler state for this context window
-        self.scheduler.__dict__.update(scheduler_state)
-
-        # Ensure context latents are on the main device
-        latents_j = current_latents_context.to(unet_device)
-
-        # Mark step for CUDA graphs if applicable
-        if (is_unet_compiled and is_brushnet_compiled) and is_torch_higher_equal_2_1:
-            torch._inductor.cudagraph_mark_step_begin()
-
-        # Expand latents for classifier-free guidance
-        latent_model_input = torch.cat([latents_j] * 2) if self.do_classifier_free_guidance else latents_j
-        latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
-
-        # --- Prepare BrushNet Inputs ---
-        # Determine control input and context-specific prompt embeddings for BrushNet
-        if guess_mode and self.do_classifier_free_guidance:
-            control_model_input = latents_j # No need to repeat here
-            control_model_input = self.scheduler.scale_model_input(control_model_input, t)
-            # Use only positive prompts, reshaped for context length
-            brushnet_prompt_embeds = original_prompt_embeds.chunk(2)[1]
-            brushnet_prompt_embeds = rearrange(repeat(brushnet_prompt_embeds, "b c d -> b t c d", t=len(context)), 'b t c d -> (b t) c d')
-        else:
-            control_model_input = latent_model_input
-            # Reshape original prompts (potentially cfg-concatenated) for context length
-            if self.do_classifier_free_guidance:
-                neg_brushnet_prompt_embeds, pos_brushnet_prompt_embeds = original_prompt_embeds.chunk(2)
-                pos_brushnet_prompt_embeds = rearrange(repeat(pos_brushnet_prompt_embeds, "b c d -> b t c d", t=len(context)), 'b t c d -> (b t) c d')
-                neg_brushnet_prompt_embeds = rearrange(repeat(neg_brushnet_prompt_embeds, "b c d -> b t c d", t=len(context)), 'b t c d -> (b t) c d')
-                brushnet_prompt_embeds = torch.cat([neg_brushnet_prompt_embeds, pos_brushnet_prompt_embeds])
-            else:
-                brushnet_prompt_embeds = rearrange(repeat(original_prompt_embeds, "b c d -> b t c d", t=len(context)), 'b t c d -> (b t) c d')
-
-        # Determine BrushNet conditioning scale
-        if isinstance(brushnet_keep[i], list):
-            cond_scale = [c * s for c, s in zip(brushnet_conditioning_scale, brushnet_keep[i])]
-        else:
-            brushnet_cond_scale = brushnet_conditioning_scale
-            if isinstance(brushnet_cond_scale, list):
-                brushnet_cond_scale = brushnet_cond_scale[0]
-            cond_scale = brushnet_cond_scale * brushnet_keep[i]
-        # --- End Prepare BrushNet Inputs ---
-
-
-        # --- BrushNet Inference & Offload ---
-        self.brushnet.to(unet_device)
-        t_val = t if isinstance(t, int) else t.item() # For printing
-        print(f"[t={t_val}, j={j}] Running BrushNet on {unet_device}...")
-
-        # Ensure inputs are on GPU
-        control_model_input_gpu = control_model_input.to(unet_device)
-        brushnet_prompt_embeds_gpu = brushnet_prompt_embeds.to(unet_device)
-        brushnet_cond_indices = context
-        # Slice conditioning_latents (already on GPU from earlier prep)
-        brushnet_cond_sliced = conditioning_latents[brushnet_cond_indices, :, :, :]
-        # Repeat for CFG if needed
-        brushnet_cond_input = torch.cat([brushnet_cond_sliced]*2) if self.do_classifier_free_guidance else brushnet_cond_sliced
-        brushnet_cond_input_gpu = brushnet_cond_input.to(unet_device) # Already on device, but ensures
-
-        # Run BrushNet
-        down_block_res_samples, mid_block_res_sample, up_block_res_samples = self.brushnet(
-            control_model_input_gpu,
-            t,
-            encoder_hidden_states=brushnet_prompt_embeds_gpu,
-            brushnet_cond=brushnet_cond_input_gpu,
-            conditioning_scale=cond_scale,
-            guess_mode=guess_mode,
-            return_dict=False,
-        )
-
-        # Move results to CPU
-        print(f"[t={t_val}, j={j}] Moving BrushNet results to CPU...")
-        down_block_res_samples_cpu = [res.to(cpu_device) for res in down_block_res_samples]
-        mid_block_res_sample_cpu = mid_block_res_sample.to(cpu_device)
-        up_block_res_samples_cpu = [res.to(cpu_device) for res in up_block_res_samples]
-
-        # Clean up GPU tensors
-        del down_block_res_samples, mid_block_res_sample, up_block_res_samples
-        del control_model_input_gpu, brushnet_prompt_embeds_gpu, brushnet_cond_input_gpu, brushnet_cond_sliced
-        if torch.cuda.is_available(): torch.cuda.empty_cache()
-        print(f"[t={t_val}, j={j}] Cleared BrushNet GPU tensors.")
-
-        # Apply guess mode logic on CPU if needed
-        if guess_mode and self.do_classifier_free_guidance:
-            print(f"[t={t_val}, j={j}] Applying guess mode logic on CPU...")
-            down_block_res_samples_cpu = [torch.cat([torch.zeros_like(d), d]) for d in down_block_res_samples_cpu]
-            mid_block_res_sample_cpu = torch.cat([torch.zeros_like(mid_block_res_sample_cpu), mid_block_res_sample_cpu])
-            up_block_res_samples_cpu = [torch.cat([torch.zeros_like(d), d]) for d in up_block_res_samples_cpu]
-
-        # Move results back to GPU for UNet
-        print(f"[t={t_val}, j={j}] Moving BrushNet results back to {unet_device} for UNet...")
-        down_block_add_samples_gpu = [res.to(unet_device) for res in down_block_res_samples_cpu]
-        mid_block_add_sample_gpu = mid_block_res_sample_cpu.to(unet_device)
-        up_block_add_samples_gpu = [res.to(unet_device) for res in up_block_res_samples_cpu]
-
-        # Clean up CPU tensors
-        del down_block_res_samples_cpu, mid_block_res_sample_cpu, up_block_res_samples_cpu
-        print(f"[t={t_val}, j={j}] Cleared BrushNet CPU tensors.")
-        # --- End BrushNet Section ---
-
-
-        # --- UNet Inference ---
-        self.unet.to(unet_device)
-        print(f"[t={t_val}, j={j}] Running UNet on {unet_device}...")
-        latent_model_input_gpu = latent_model_input.to(unet_device)
-        # Use the ORIGINAL prompt embeddings (already prepared for CFG if needed) for the UNet
-        unet_prompt_embeds_gpu = original_prompt_embeds.to(unet_device)
-        timestep_cond_gpu = timestep_cond.to(unet_device) if timestep_cond is not None else None
-
-        # Run UNet
-        noise_pred = self.unet(
-            latent_model_input_gpu, # Shape (2*T, C, H, W) or (T, C, H, W)
-            t,
-            encoder_hidden_states=unet_prompt_embeds_gpu, # Shape (2*B, Seq, Dim) or (B, Seq, Dim)
-            timestep_cond=timestep_cond_gpu,
-            cross_attention_kwargs=self.cross_attention_kwargs,
-            down_block_add_samples=down_block_add_samples_gpu,
-            mid_block_add_sample=mid_block_add_sample_gpu,
-            up_block_add_samples=up_block_add_samples_gpu,
-            added_cond_kwargs=added_cond_kwargs,
-            return_dict=False,
-            num_frames=len(context), # Pass the length of the current context
-        )[0] # noise_pred shape matches latent_model_input_gpu
-
-        # Clean up UNet inputs and BrushNet GPU results
-        print(f"[t={t_val}, j={j}] Deleting UNet inputs and BrushNet GPU results...")
-        del down_block_add_samples_gpu, mid_block_add_sample_gpu, up_block_add_samples_gpu
-        del latent_model_input_gpu, unet_prompt_embeds_gpu
-        if torch.cuda.is_available(): torch.cuda.empty_cache()
-        # --- End UNet Section ---
-
-        # Perform guidance
-        if self.do_classifier_free_guidance:
-            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-            noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
-            del noise_pred_uncond, noise_pred_text # Delete chunks
-
-        # --- Scheduler Step ---
-        print(f"[t={t_val}, j={j}] Devices BEFORE scheduler step: latents_j={latents_j.device}, noise_pred={noise_pred.device}, t={'builtin' if isinstance(t,int) else t.device}")
-
-        # Ensure inputs are on the correct device and correct type for scheduler
-        noise_pred_step = noise_pred.to(unet_device)
-        latents_j_step = latents_j.to(unet_device) # latents_j was already moved to unet_device
-
-        if not torch.is_tensor(t):
-            t_step = torch.tensor([t], device=unet_device, dtype=torch.long)
-        else:
-            # Ensure t is long and on the correct device
-            t_step = t.to(device=unet_device, dtype=torch.long)
-
-        print(f"[t={t_val}, j={j}] Devices AFTER explicit .to(unet_device): latents_j={latents_j_step.device}, noise_pred={noise_pred_step.device}, t={t_step.device}")
-
-        # Compute the previous noisy sample x_t -> x_t-1
-        try:
-            # Squeeze t_step if it's not scalar (some schedulers might expect scalar/1D)
-            latents_j_out = self.scheduler.step(
-                noise_pred_step,
-                t_step.squeeze(),
-                latents_j_step,
-                **extra_step_kwargs,
-                return_dict=False
-            )[0]
-        except RuntimeError as e:
-            print(f"ERROR during scheduler.step: {e}")
-            print(f"Device Check: noise_pred={noise_pred_step.device}, t={t_step.device}, latents={latents_j_step.device}")
-            raise e
-
-        # Clean up noise prediction and step-specific tensors
-        del noise_pred, noise_pred_step, latents_j_step
-        if torch.cuda.is_available(): torch.cuda.empty_cache()
-
-        # Result latents_j_out is on unet_device
-        latents_j = latents_j_out # Reuse variable name for the output of the step
-        # --- End Scheduler Step ---
-
-
-        # --- Update Accumulated Value and Count Tensors (In-Place) ---
-        print(f"[t={t_val}, j={j}] Devices BEFORE value update: value={value.device}, latents_j={latents_j.device}")
-
-        # Ensure latents_j is definitely on the target device (redundant but safe)
-        latents_j_update = latents_j.to(unet_device)
-
-        # Increment count for the processed context indices
-        # count shape is [T, 1, H, W], broadcasting works with [context, ...] indexing
-        count[context, ...] += 1
-
-        # --- Blending/Assignment Logic (Modifies 'value' in-place) ---
-        if j == 0:
-            # First context window: direct assignment
-            print(f"[t={t_val}, j={j}] Assigning (j=0): value[{list(context.shape)}] = latents_j[{list(latents_j_update.shape)}]")
-            value[context, ...] = latents_j_update
-        else:
-            # Subsequent windows: blend overlap, assign non-overlap
-            # Find indices within the *current context* that have already been processed (count > 1)
-            # Need to check the count tensor *at the global indices* defined by context
-            # Indexing count[:, 0, 0, 0] is valid for shape [T, 1, H, W]
-            overlap_indices_local = [idx for idx, global_idx in enumerate(context) if count[global_idx, 0, 0, 0] > 1]
-            overlap_len = len(overlap_indices_local)
-
-            if overlap_len > 0:
-                # Calculate blending ratios on the correct device
-                ratio_next = torch.linspace(0, 1, overlap_len + 2, device=unet_device, dtype=latents_j_update.dtype)[1:-1]
-                ratio_pre = 1.0 - ratio_next
-
-                print(f"[t={t_val}, j={j}] Blending {overlap_len} frames...")
-                # Blend the overlapping part
-                for k, local_idx in enumerate(overlap_indices_local):
-                    global_idx = context[local_idx] # Global index in 'value'/'count'
-                    # Ensure parts being blended are on the correct device
-                    value_part = value[global_idx, ...].to(unet_device) # Get existing value
-                    latents_j_part = latents_j_update[local_idx, ...] # Get new value for this index
-                    # Blend: value = value * ratio_pre + latents_j * ratio_next
-                    value[global_idx, ...] = value_part * ratio_pre[k] + latents_j_part * ratio_next[k]
-
-                # Assign the non-overlapping part (overwrite)
-                assign_start_local_idx = overlap_indices_local[-1] + 1
-                if assign_start_local_idx < len(context): # Check if there are non-overlapping frames
-                    print(f"[t={t_val}, j={j}] Assigning non-overlap from local index {assign_start_local_idx}...")
-                    # Get global indices for assignment
-                    assign_global_indices = context[assign_start_local_idx:]
-                    # Get corresponding latents data
-                    assign_latents_data = latents_j_update[assign_start_local_idx:, ...]
-                    value[assign_global_indices, ...] = assign_latents_data
-            else:
-                # No overlap found with previous windows in this timestep
-                print(f"[t={t_val}, j={j}] Assigning full chunk (j>0, no overlap found)...")
-                value[context, ...] = latents_j_update # Assign the whole chunk
-
-        print(f"[t={t_val}, j={j}] Device AFTER value update: value={value.device}")
-        # --- End Update Section ---
-
-        # Return the modified tensors (caller will use them)
-        return value, count
-
     @torch.no_grad()
     def __call__(
         self,
@@ -1590,46 +1324,21 @@ class StableDiffusionDiffuEraserPipeline(
                     )
                 # --- End inner context loop ---
 
-                # --- Update latents for the next timestep ---
-                # The accumulated results are in 'value'. Clone it for the next iteration.
-                # Revert to original logic: simply clone the accumulated value.
-                latents = value.clone()
-                # Log the update
-                print(f"--- Updated latents tensor for next step (cloned from value), shape: {latents.shape} on {latents.device} ---")
-                # ---
-
-                # --- Handle callbacks ---
-                if callback_on_step_end is not None:
-                    callback_kwargs = {}
-                    # Populate callback_kwargs carefully, ensuring variables exist
-                    local_vars = locals()
-                    for k in callback_on_step_end_tensor_inputs:
-                         # Prioritize local variables, then instance attributes
-                         if k in local_vars:
-                             callback_kwargs[k] = local_vars[k]
-                         elif hasattr(self, k):
-                             callback_kwargs[k] = getattr(self, k)
-                         # Add specific important variables if not covered but needed by callback
-                         elif k == 'prompt_embeds': # If callback expects 'prompt_embeds' specifically
-                             callback_kwargs[k] = prompt_embeds_unet
-
-                    # Call the callback function
-                    callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
-
-                    # Update pipeline state based on callback output (if provided)
-                    latents = callback_outputs.pop("latents", latents)
-                    # Allow callback to potentially modify prompt embeds (use with caution)
-                    # prompt_embeds_unet = callback_outputs.pop("prompt_embeds", prompt_embeds_unet)
-
-                # Update progress bar based on scheduler order
-                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
-                    progress_bar.update()
-                    # Handle legacy callback
-                    if callback is not None and i % callback_steps == 0:
-                         step_idx = i // getattr(self.scheduler, "order", 1)
-                         callback(step_idx, t, latents) # Pass current latents
-
-
+                # Replace the original block with this call:
+                latents = self._finalize_timestep(
+                    value=value,
+                    latents=latents, # Pass current latents
+                    i=i,
+                    t=t,
+                    timesteps=timesteps,
+                    num_warmup_steps=num_warmup_steps,
+                    progress_bar=progress_bar,
+                    prompt_embeds_unet=prompt_embeds_unet, # Pass embeds for callback use
+                    callback_on_step_end=callback_on_step_end,
+                    callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
+                    callback=callback, # Pass legacy callback function
+                    callback_steps=callback_steps # Pass legacy callback steps
+                )
         # --- End Denoising Loop ---
 
         # Offload models if sequential offloading is enabled
@@ -1684,3 +1393,353 @@ class StableDiffusionDiffuEraserPipeline(
              # Return the full output object
              print("--- Returning decoded frames and final latents ---")
              return output
+
+
+    # Define the helper method within the class
+    def _process_context_step(
+        self,
+        j: int,
+        context: np.ndarray, # Or torch.Tensor depending on context_list type
+        scheduler_state: Dict,
+        current_latents_context: torch.Tensor, # Input latents SLICE for this context
+        value: torch.Tensor, # Accumulated results tensor (modified by blending/assignment)
+        count: torch.Tensor, # Accumulated counts tensor (incremented)
+        t: Union[torch.Tensor, int], # Current timestep
+        i: int, # Outer loop index (for brushnet_keep)
+        unet_device: torch.device,
+        cpu_device: torch.device,
+        original_prompt_embeds: torch.Tensor, # Embeds for UNet (potentially cfg-concatenated)
+        conditioning_latents: torch.Tensor,
+        timestep_cond: Optional[torch.Tensor],
+        brushnet_keep: List,
+        brushnet_conditioning_scale: Union[float, List[float]],
+        guess_mode: bool,
+        is_unet_compiled: bool,
+        is_brushnet_compiled: bool,
+        is_torch_higher_equal_2_1: bool,
+        extra_step_kwargs: Dict,
+        added_cond_kwargs: Optional[Dict],
+    ) -> Tuple[torch.Tensor, torch.Tensor]: # Returns updated value, count (modified in place)
+        """
+        Processes a single context window (j) within a denoising timestep (t).
+        Updates the `value` and `count` tensors based on the processing of `current_latents_context`.
+        (Keep full docstring as before)
+        """
+        # Restore scheduler state for this context window
+        self.scheduler.__dict__.update(scheduler_state)
+
+        # Ensure context latents are on the main device
+        latents_j = current_latents_context.to(unet_device)
+
+        # Mark step for CUDA graphs if applicable
+        if (is_unet_compiled and is_brushnet_compiled) and is_torch_higher_equal_2_1:
+            torch._inductor.cudagraph_mark_step_begin()
+
+        # Expand latents for classifier-free guidance
+        latent_model_input = torch.cat([latents_j] * 2) if self.do_classifier_free_guidance else latents_j
+        latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+
+        # --- Prepare BrushNet Inputs ---
+        # Determine control input and context-specific prompt embeddings for BrushNet
+        if guess_mode and self.do_classifier_free_guidance:
+            control_model_input = latents_j # No need to repeat here
+            control_model_input = self.scheduler.scale_model_input(control_model_input, t)
+            # Use only positive prompts, reshaped for context length
+            brushnet_prompt_embeds = original_prompt_embeds.chunk(2)[1]
+            brushnet_prompt_embeds = rearrange(repeat(brushnet_prompt_embeds, "b c d -> b t c d", t=len(context)), 'b t c d -> (b t) c d')
+        else:
+            control_model_input = latent_model_input
+            # Reshape original prompts (potentially cfg-concatenated) for context length
+            if self.do_classifier_free_guidance:
+                neg_brushnet_prompt_embeds, pos_brushnet_prompt_embeds = original_prompt_embeds.chunk(2)
+                pos_brushnet_prompt_embeds = rearrange(repeat(pos_brushnet_prompt_embeds, "b c d -> b t c d", t=len(context)), 'b t c d -> (b t) c d')
+                neg_brushnet_prompt_embeds = rearrange(repeat(neg_brushnet_prompt_embeds, "b c d -> b t c d", t=len(context)), 'b t c d -> (b t) c d')
+                brushnet_prompt_embeds = torch.cat([neg_brushnet_prompt_embeds, pos_brushnet_prompt_embeds])
+            else:
+                brushnet_prompt_embeds = rearrange(repeat(original_prompt_embeds, "b c d -> b t c d", t=len(context)), 'b t c d -> (b t) c d')
+
+        # Determine BrushNet conditioning scale
+        if isinstance(brushnet_keep[i], list):
+            cond_scale = [c * s for c, s in zip(brushnet_conditioning_scale, brushnet_keep[i])]
+        else:
+            brushnet_cond_scale = brushnet_conditioning_scale
+            if isinstance(brushnet_cond_scale, list):
+                brushnet_cond_scale = brushnet_cond_scale[0]
+            cond_scale = brushnet_cond_scale * brushnet_keep[i]
+        # --- End Prepare BrushNet Inputs ---
+
+        # --- BrushNet Inference & Offload ---
+        self.brushnet.to(unet_device)
+        t_val = t if isinstance(t, int) else t.item() # For printing
+        print(f"[t={t_val}, j={j}] Running BrushNet on {unet_device}...")
+
+        # Ensure inputs are on GPU
+        control_model_input_gpu = control_model_input.to(unet_device)
+        brushnet_prompt_embeds_gpu = brushnet_prompt_embeds.to(unet_device)
+        brushnet_cond_indices = context
+        # Slice conditioning_latents (already on GPU from earlier prep)
+        brushnet_cond_sliced = conditioning_latents[brushnet_cond_indices, :, :, :]
+        # Repeat for CFG if needed
+        brushnet_cond_input = torch.cat([brushnet_cond_sliced]*2) if self.do_classifier_free_guidance else brushnet_cond_sliced
+        brushnet_cond_input_gpu = brushnet_cond_input.to(unet_device) # Already on device, but ensures
+
+        # Run BrushNet
+        down_block_res_samples, mid_block_res_sample, up_block_res_samples = self.brushnet(
+            control_model_input_gpu,
+            t,
+            encoder_hidden_states=brushnet_prompt_embeds_gpu,
+            brushnet_cond=brushnet_cond_input_gpu,
+            conditioning_scale=cond_scale,
+            guess_mode=guess_mode,
+            return_dict=False,
+        )
+
+        # Move results to CPU
+        print(f"[t={t_val}, j={j}] Moving BrushNet results to CPU...")
+        down_block_res_samples_cpu = [res.to(cpu_device) for res in down_block_res_samples]
+        mid_block_res_sample_cpu = mid_block_res_sample.to(cpu_device)
+        up_block_res_samples_cpu = [res.to(cpu_device) for res in up_block_res_samples]
+
+        # Clean up GPU tensors
+        del down_block_res_samples, mid_block_res_sample, up_block_res_samples
+        del control_model_input_gpu, brushnet_prompt_embeds_gpu, brushnet_cond_input_gpu, brushnet_cond_sliced
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
+        print(f"[t={t_val}, j={j}] Cleared BrushNet GPU tensors.")
+
+        # Apply guess mode logic on CPU if needed
+        if guess_mode and self.do_classifier_free_guidance:
+            print(f"[t={t_val}, j={j}] Applying guess mode logic on CPU...")
+            down_block_res_samples_cpu = [torch.cat([torch.zeros_like(d), d]) for d in down_block_res_samples_cpu]
+            mid_block_res_sample_cpu = torch.cat([torch.zeros_like(mid_block_res_sample_cpu), mid_block_res_sample_cpu])
+            up_block_res_samples_cpu = [torch.cat([torch.zeros_like(d), d]) for d in up_block_res_samples_cpu]
+
+        # Move results back to GPU for UNet
+        print(f"[t={t_val}, j={j}] Moving BrushNet results back to {unet_device} for UNet...")
+        down_block_add_samples_gpu = [res.to(unet_device) for res in down_block_res_samples_cpu]
+        mid_block_add_sample_gpu = mid_block_res_sample_cpu.to(unet_device)
+        up_block_add_samples_gpu = [res.to(unet_device) for res in up_block_res_samples_cpu]
+
+        # Clean up CPU tensors
+        del down_block_res_samples_cpu, mid_block_res_sample_cpu, up_block_res_samples_cpu
+        print(f"[t={t_val}, j={j}] Cleared BrushNet CPU tensors.")
+        # --- End BrushNet Section ---
+
+
+        # --- UNet Inference ---
+        self.unet.to(unet_device)
+        print(f"[t={t_val}, j={j}] Running UNet on {unet_device}...")
+        latent_model_input_gpu = latent_model_input.to(unet_device)
+        # Use the ORIGINAL prompt embeddings (already prepared for CFG if needed) for the UNet
+        unet_prompt_embeds_gpu = original_prompt_embeds.to(unet_device)
+        timestep_cond_gpu = timestep_cond.to(unet_device) if timestep_cond is not None else None
+
+        # Run UNet
+        noise_pred = self.unet(
+            latent_model_input_gpu, # Shape (2*T, C, H, W) or (T, C, H, W)
+            t,
+            encoder_hidden_states=unet_prompt_embeds_gpu, # Shape (2*B, Seq, Dim) or (B, Seq, Dim)
+            timestep_cond=timestep_cond_gpu,
+            cross_attention_kwargs=self.cross_attention_kwargs,
+            down_block_add_samples=down_block_add_samples_gpu,
+            mid_block_add_sample=mid_block_add_sample_gpu,
+            up_block_add_samples=up_block_add_samples_gpu,
+            added_cond_kwargs=added_cond_kwargs,
+            return_dict=False,
+            num_frames=len(context), # Pass the length of the current context
+        )[0] # noise_pred shape matches latent_model_input_gpu
+
+        # Clean up UNet inputs and BrushNet GPU results
+        print(f"[t={t_val}, j={j}] Deleting UNet inputs and BrushNet GPU results...")
+        del down_block_add_samples_gpu, mid_block_add_sample_gpu, up_block_add_samples_gpu
+        del latent_model_input_gpu, unet_prompt_embeds_gpu
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
+        # --- End UNet Section ---
+
+        # Perform guidance
+        if self.do_classifier_free_guidance:
+            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+            noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
+            del noise_pred_uncond, noise_pred_text # Delete chunks
+
+        # --- Scheduler Step ---
+        print(f"[t={t_val}, j={j}] Devices BEFORE scheduler step: latents_j={latents_j.device}, noise_pred={noise_pred.device}, t={'builtin' if isinstance(t,int) else t.device}")
+
+        # Ensure inputs are on the correct device and correct type for scheduler
+        noise_pred_step = noise_pred.to(unet_device)
+        latents_j_step = latents_j.to(unet_device) # latents_j was already moved to unet_device
+
+        if not torch.is_tensor(t):
+            t_step = torch.tensor([t], device=unet_device, dtype=torch.long)
+        else:
+            # Ensure t is long and on the correct device
+            t_step = t.to(device=unet_device, dtype=torch.long)
+
+        print(f"[t={t_val}, j={j}] Devices AFTER explicit .to(unet_device): latents_j={latents_j_step.device}, noise_pred={noise_pred_step.device}, t={t_step.device}")
+
+        # Compute the previous noisy sample x_t -> x_t-1
+        try:
+            # Squeeze t_step if it's not scalar (some schedulers might expect scalar/1D)
+            latents_j_out = self.scheduler.step(
+                noise_pred_step,
+                t_step.squeeze(),
+                latents_j_step,
+                **extra_step_kwargs,
+                return_dict=False
+            )[0]
+        except RuntimeError as e:
+            print(f"ERROR during scheduler.step: {e}")
+            print(f"Device Check: noise_pred={noise_pred_step.device}, t={t_step.device}, latents={latents_j_step.device}")
+            raise e
+
+        # Clean up noise prediction and step-specific tensors
+        del noise_pred, noise_pred_step, latents_j_step
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
+
+        # Result latents_j_out is on unet_device
+        latents_j = latents_j_out # Reuse variable name for the output of the step
+        # --- End Scheduler Step ---
+
+
+        # --- Update Accumulated Value and Count Tensors (In-Place) ---
+        print(f"[t={t_val}, j={j}] Devices BEFORE value update: value={value.device}, latents_j={latents_j.device}")
+
+        # Ensure latents_j is definitely on the target device (redundant but safe)
+        latents_j_update = latents_j.to(unet_device)
+
+        # Increment count for the processed context indices
+        # count shape is [T, 1, H, W], broadcasting works with [context, ...] indexing
+        count[context, ...] += 1
+
+        # --- Blending/Assignment Logic (Modifies 'value' in-place) ---
+        if j == 0:
+            # First context window: direct assignment
+            print(f"[t={t_val}, j={j}] Assigning (j=0): value[{list(context.shape)}] = latents_j[{list(latents_j_update.shape)}]")
+            value[context, ...] = latents_j_update
+        else:
+            # Subsequent windows: blend overlap, assign non-overlap
+            # Find indices within the *current context* that have already been processed (count > 1)
+            # Need to check the count tensor *at the global indices* defined by context
+            # Indexing count[:, 0, 0, 0] is valid for shape [T, 1, H, W]
+            overlap_indices_local = [idx for idx, global_idx in enumerate(context) if count[global_idx, 0, 0, 0] > 1]
+            overlap_len = len(overlap_indices_local)
+
+            if overlap_len > 0:
+                # Calculate blending ratios on the correct device
+                ratio_next = torch.linspace(0, 1, overlap_len + 2, device=unet_device, dtype=latents_j_update.dtype)[1:-1]
+                ratio_pre = 1.0 - ratio_next
+
+                print(f"[t={t_val}, j={j}] Blending {overlap_len} frames...")
+                # Blend the overlapping part
+                for k, local_idx in enumerate(overlap_indices_local):
+                    global_idx = context[local_idx] # Global index in 'value'/'count'
+                    # Ensure parts being blended are on the correct device
+                    value_part = value[global_idx, ...].to(unet_device) # Get existing value
+                    latents_j_part = latents_j_update[local_idx, ...] # Get new value for this index
+                    # Blend: value = value * ratio_pre + latents_j * ratio_next
+                    value[global_idx, ...] = value_part * ratio_pre[k] + latents_j_part * ratio_next[k]
+
+                # Assign the non-overlapping part (overwrite)
+                assign_start_local_idx = overlap_indices_local[-1] + 1
+                if assign_start_local_idx < len(context): # Check if there are non-overlapping frames
+                    print(f"[t={t_val}, j={j}] Assigning non-overlap from local index {assign_start_local_idx}...")
+                    # Get global indices for assignment
+                    assign_global_indices = context[assign_start_local_idx:]
+                    # Get corresponding latents data
+                    assign_latents_data = latents_j_update[assign_start_local_idx:, ...]
+                    value[assign_global_indices, ...] = assign_latents_data
+            else:
+                # No overlap found with previous windows in this timestep
+                print(f"[t={t_val}, j={j}] Assigning full chunk (j>0, no overlap found)...")
+                value[context, ...] = latents_j_update # Assign the whole chunk
+
+        print(f"[t={t_val}, j={j}] Device AFTER value update: value={value.device}")
+        # --- End Update Section ---
+
+        # Return the modified tensors (caller will use them)
+        return value, count
+
+
+    def _finalize_timestep(
+        self,
+        value: torch.Tensor,
+        latents: torch.Tensor,
+        i: int,
+        t: Union[int, torch.Tensor],
+        timesteps: Union[List[int], torch.Tensor], # Accept List or Tensor
+        num_warmup_steps: int,
+        progress_bar, # Type hint can be tricky (e.g., tqdm object)
+        prompt_embeds_unet: torch.Tensor, # Pass embeds needed for potential callback use
+        callback_on_step_end: Optional[Callable],
+        callback_on_step_end_tensor_inputs: List[str],
+        callback: Optional[Callable], # Legacy callback
+        callback_steps: Optional[int] # Legacy callback steps
+    ) -> torch.Tensor: # Returns the potentially updated latents
+        """
+        Finalizes a denoising timestep by updating latents from accumulated values,
+        handling callbacks, and updating the progress bar.
+
+        Args:
+            value: Accumulated latent values from context window processing for this timestep.
+            latents: The latents tensor *before* this finalization step.
+            i: The index of the current timestep in the main loop.
+            t: The current timestep value.
+            timesteps: The list or tensor of all timesteps.
+            num_warmup_steps: Number of warmup steps.
+            progress_bar: The progress bar object.
+            prompt_embeds_unet: The prompt embeddings used by the UNet (for callbacks).
+            callback_on_step_end: The main callback function.
+            callback_on_step_end_tensor_inputs: Keys requested by the main callback.
+            callback: Legacy callback function.
+            callback_steps: Frequency for the legacy callback.
+        Returns:
+            The updated latents tensor for the next timestep.
+        """
+        # --- Update latents for the next timestep ---
+        # The accumulated results are in 'value'. Clone it for the next iteration.
+        # Revert to original logic: simply clone the accumulated value.
+        latents = value.clone()
+        # Log the update
+        t_val = t if isinstance(t, int) else t.item() # For printing
+        print(f"--- [t={t_val}] Updated latents tensor for next step (cloned from value), shape: {latents.shape} on {latents.device} ---")
+        # ---
+
+        # --- Handle callbacks ---
+        if callback_on_step_end is not None:
+            callback_kwargs = {}
+            # Build the dictionary of requested tensors for the callback
+            # Map known parameter names to potential callback keys
+            param_map = {
+                "latents": latents, # Pass the newly updated latents
+                "prompt_embeds": prompt_embeds_unet,
+                "timestep": t,
+                "step_index": i,
+                # Add other variables passed as parameters if they might be requested
+            }
+            for k in callback_on_step_end_tensor_inputs:
+                if k in param_map:
+                    callback_kwargs[k] = param_map[k]
+                elif hasattr(self, k): # Check instance attributes if not in direct params
+                     callback_kwargs[k] = getattr(self, k)
+                # else: print(f"Warning: Callback requested key '{k}' not found.")
+
+            # Call the callback function
+            callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+
+            # Update pipeline state based on callback output (if provided)
+            # Primarily update latents if the callback returned a modified version
+            latents = callback_outputs.pop("latents", latents)
+            # Note: Modifying other state like prompt_embeds via callback is possible but complex
+
+        # --- Update progress bar ---
+        # Update based on scheduler order (updates less frequently for some schedulers)
+        if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+            progress_bar.update()
+            # --- Handle legacy callback ---
+            if callback is not None and callback_steps is not None and i % callback_steps == 0:
+                 # Calculate step index compatible with legacy expectations
+                 step_idx = i // getattr(self.scheduler, "order", 1)
+                 # Call legacy callback with the potentially modified latents
+                 callback(step_idx, t, latents)
+
+        # Return the potentially modified latents to be used in the next iteration
+        return latents
