@@ -849,7 +849,272 @@ class StableDiffusionDiffuEraserPipeline(
     def num_timesteps(self):
         return self._num_timesteps
 
-    # based on BrushNet: https://github.com/TencentARC/BrushNet/blob/main/src/diffusers/pipelines/brushnet/pipeline_brushnet.py
+    
+    # Define the helper method within the class
+    # Define the helper method within the class
+    def _process_context_step(
+        self,
+        j: int,
+        context: np.ndarray, # Or torch.Tensor depending on context_list type
+        scheduler_state: Dict,
+        current_latents_context: torch.Tensor, # Input latents SLICE for this context
+        value: torch.Tensor, # Accumulated results tensor (modified by blending/assignment)
+        count: torch.Tensor, # Accumulated counts tensor (incremented)
+        t: Union[torch.Tensor, int], # Current timestep
+        i: int, # Outer loop index (for brushnet_keep)
+        unet_device: torch.device,
+        cpu_device: torch.device,
+        original_prompt_embeds: torch.Tensor, # Embeds for UNet (potentially cfg-concatenated)
+        conditioning_latents: torch.Tensor,
+        timestep_cond: Optional[torch.Tensor],
+        brushnet_keep: List,
+        brushnet_conditioning_scale: Union[float, List[float]],
+        guess_mode: bool,
+        is_unet_compiled: bool,
+        is_brushnet_compiled: bool,
+        is_torch_higher_equal_2_1: bool,
+        extra_step_kwargs: Dict,
+        added_cond_kwargs: Optional[Dict],
+    ) -> Tuple[torch.Tensor, torch.Tensor]: # Returns updated value, count (modified in place)
+        """
+        Processes a single context window (j) within a denoising timestep (t).
+        Updates the `value` and `count` tensors based on the processing of `current_latents_context`.
+        (Keep full docstring as before)
+        """
+        # Restore scheduler state for this context window
+        self.scheduler.__dict__.update(scheduler_state)
+
+        # Ensure context latents are on the main device
+        latents_j = current_latents_context.to(unet_device)
+
+        # Mark step for CUDA graphs if applicable
+        if (is_unet_compiled and is_brushnet_compiled) and is_torch_higher_equal_2_1:
+            torch._inductor.cudagraph_mark_step_begin()
+
+        # Expand latents for classifier-free guidance
+        latent_model_input = torch.cat([latents_j] * 2) if self.do_classifier_free_guidance else latents_j
+        latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+
+        # --- Prepare BrushNet Inputs ---
+        # Determine control input and context-specific prompt embeddings for BrushNet
+        if guess_mode and self.do_classifier_free_guidance:
+            control_model_input = latents_j # No need to repeat here
+            control_model_input = self.scheduler.scale_model_input(control_model_input, t)
+            # Use only positive prompts, reshaped for context length
+            brushnet_prompt_embeds = original_prompt_embeds.chunk(2)[1]
+            brushnet_prompt_embeds = rearrange(repeat(brushnet_prompt_embeds, "b c d -> b t c d", t=len(context)), 'b t c d -> (b t) c d')
+        else:
+            control_model_input = latent_model_input
+            # Reshape original prompts (potentially cfg-concatenated) for context length
+            if self.do_classifier_free_guidance:
+                neg_brushnet_prompt_embeds, pos_brushnet_prompt_embeds = original_prompt_embeds.chunk(2)
+                pos_brushnet_prompt_embeds = rearrange(repeat(pos_brushnet_prompt_embeds, "b c d -> b t c d", t=len(context)), 'b t c d -> (b t) c d')
+                neg_brushnet_prompt_embeds = rearrange(repeat(neg_brushnet_prompt_embeds, "b c d -> b t c d", t=len(context)), 'b t c d -> (b t) c d')
+                brushnet_prompt_embeds = torch.cat([neg_brushnet_prompt_embeds, pos_brushnet_prompt_embeds])
+            else:
+                brushnet_prompt_embeds = rearrange(repeat(original_prompt_embeds, "b c d -> b t c d", t=len(context)), 'b t c d -> (b t) c d')
+
+        # Determine BrushNet conditioning scale
+        if isinstance(brushnet_keep[i], list):
+            cond_scale = [c * s for c, s in zip(brushnet_conditioning_scale, brushnet_keep[i])]
+        else:
+            brushnet_cond_scale = brushnet_conditioning_scale
+            if isinstance(brushnet_cond_scale, list):
+                brushnet_cond_scale = brushnet_cond_scale[0]
+            cond_scale = brushnet_cond_scale * brushnet_keep[i]
+        # --- End Prepare BrushNet Inputs ---
+
+
+        # --- BrushNet Inference & Offload ---
+        self.brushnet.to(unet_device)
+        t_val = t if isinstance(t, int) else t.item() # For printing
+        print(f"[t={t_val}, j={j}] Running BrushNet on {unet_device}...")
+
+        # Ensure inputs are on GPU
+        control_model_input_gpu = control_model_input.to(unet_device)
+        brushnet_prompt_embeds_gpu = brushnet_prompt_embeds.to(unet_device)
+        brushnet_cond_indices = context
+        # Slice conditioning_latents (already on GPU from earlier prep)
+        brushnet_cond_sliced = conditioning_latents[brushnet_cond_indices, :, :, :]
+        # Repeat for CFG if needed
+        brushnet_cond_input = torch.cat([brushnet_cond_sliced]*2) if self.do_classifier_free_guidance else brushnet_cond_sliced
+        brushnet_cond_input_gpu = brushnet_cond_input.to(unet_device) # Already on device, but ensures
+
+        # Run BrushNet
+        down_block_res_samples, mid_block_res_sample, up_block_res_samples = self.brushnet(
+            control_model_input_gpu,
+            t,
+            encoder_hidden_states=brushnet_prompt_embeds_gpu,
+            brushnet_cond=brushnet_cond_input_gpu,
+            conditioning_scale=cond_scale,
+            guess_mode=guess_mode,
+            return_dict=False,
+        )
+
+        # Move results to CPU
+        print(f"[t={t_val}, j={j}] Moving BrushNet results to CPU...")
+        down_block_res_samples_cpu = [res.to(cpu_device) for res in down_block_res_samples]
+        mid_block_res_sample_cpu = mid_block_res_sample.to(cpu_device)
+        up_block_res_samples_cpu = [res.to(cpu_device) for res in up_block_res_samples]
+
+        # Clean up GPU tensors
+        del down_block_res_samples, mid_block_res_sample, up_block_res_samples
+        del control_model_input_gpu, brushnet_prompt_embeds_gpu, brushnet_cond_input_gpu, brushnet_cond_sliced
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
+        print(f"[t={t_val}, j={j}] Cleared BrushNet GPU tensors.")
+
+        # Apply guess mode logic on CPU if needed
+        if guess_mode and self.do_classifier_free_guidance:
+            print(f"[t={t_val}, j={j}] Applying guess mode logic on CPU...")
+            down_block_res_samples_cpu = [torch.cat([torch.zeros_like(d), d]) for d in down_block_res_samples_cpu]
+            mid_block_res_sample_cpu = torch.cat([torch.zeros_like(mid_block_res_sample_cpu), mid_block_res_sample_cpu])
+            up_block_res_samples_cpu = [torch.cat([torch.zeros_like(d), d]) for d in up_block_res_samples_cpu]
+
+        # Move results back to GPU for UNet
+        print(f"[t={t_val}, j={j}] Moving BrushNet results back to {unet_device} for UNet...")
+        down_block_add_samples_gpu = [res.to(unet_device) for res in down_block_res_samples_cpu]
+        mid_block_add_sample_gpu = mid_block_res_sample_cpu.to(unet_device)
+        up_block_add_samples_gpu = [res.to(unet_device) for res in up_block_res_samples_cpu]
+
+        # Clean up CPU tensors
+        del down_block_res_samples_cpu, mid_block_res_sample_cpu, up_block_res_samples_cpu
+        print(f"[t={t_val}, j={j}] Cleared BrushNet CPU tensors.")
+        # --- End BrushNet Section ---
+
+
+        # --- UNet Inference ---
+        self.unet.to(unet_device)
+        print(f"[t={t_val}, j={j}] Running UNet on {unet_device}...")
+        latent_model_input_gpu = latent_model_input.to(unet_device)
+        # Use the ORIGINAL prompt embeddings (already prepared for CFG if needed) for the UNet
+        unet_prompt_embeds_gpu = original_prompt_embeds.to(unet_device)
+        timestep_cond_gpu = timestep_cond.to(unet_device) if timestep_cond is not None else None
+
+        # Run UNet
+        noise_pred = self.unet(
+            latent_model_input_gpu, # Shape (2*T, C, H, W) or (T, C, H, W)
+            t,
+            encoder_hidden_states=unet_prompt_embeds_gpu, # Shape (2*B, Seq, Dim) or (B, Seq, Dim)
+            timestep_cond=timestep_cond_gpu,
+            cross_attention_kwargs=self.cross_attention_kwargs,
+            down_block_add_samples=down_block_add_samples_gpu,
+            mid_block_add_sample=mid_block_add_sample_gpu,
+            up_block_add_samples=up_block_add_samples_gpu,
+            added_cond_kwargs=added_cond_kwargs,
+            return_dict=False,
+            num_frames=len(context), # Pass the length of the current context
+        )[0] # noise_pred shape matches latent_model_input_gpu
+
+        # Clean up UNet inputs and BrushNet GPU results
+        print(f"[t={t_val}, j={j}] Deleting UNet inputs and BrushNet GPU results...")
+        del down_block_add_samples_gpu, mid_block_add_sample_gpu, up_block_add_samples_gpu
+        del latent_model_input_gpu, unet_prompt_embeds_gpu
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
+        # --- End UNet Section ---
+
+        # Perform guidance
+        if self.do_classifier_free_guidance:
+            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+            noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
+            del noise_pred_uncond, noise_pred_text # Delete chunks
+
+        # --- Scheduler Step ---
+        print(f"[t={t_val}, j={j}] Devices BEFORE scheduler step: latents_j={latents_j.device}, noise_pred={noise_pred.device}, t={'builtin' if isinstance(t,int) else t.device}")
+
+        # Ensure inputs are on the correct device and correct type for scheduler
+        noise_pred_step = noise_pred.to(unet_device)
+        latents_j_step = latents_j.to(unet_device) # latents_j was already moved to unet_device
+
+        if not torch.is_tensor(t):
+            t_step = torch.tensor([t], device=unet_device, dtype=torch.long)
+        else:
+            # Ensure t is long and on the correct device
+            t_step = t.to(device=unet_device, dtype=torch.long)
+
+        print(f"[t={t_val}, j={j}] Devices AFTER explicit .to(unet_device): latents_j={latents_j_step.device}, noise_pred={noise_pred_step.device}, t={t_step.device}")
+
+        # Compute the previous noisy sample x_t -> x_t-1
+        try:
+            # Squeeze t_step if it's not scalar (some schedulers might expect scalar/1D)
+            latents_j_out = self.scheduler.step(
+                noise_pred_step,
+                t_step.squeeze(),
+                latents_j_step,
+                **extra_step_kwargs,
+                return_dict=False
+            )[0]
+        except RuntimeError as e:
+            print(f"ERROR during scheduler.step: {e}")
+            print(f"Device Check: noise_pred={noise_pred_step.device}, t={t_step.device}, latents={latents_j_step.device}")
+            raise e
+
+        # Clean up noise prediction and step-specific tensors
+        del noise_pred, noise_pred_step, latents_j_step
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
+
+        # Result latents_j_out is on unet_device
+        latents_j = latents_j_out # Reuse variable name for the output of the step
+        # --- End Scheduler Step ---
+
+
+        # --- Update Accumulated Value and Count Tensors (In-Place) ---
+        print(f"[t={t_val}, j={j}] Devices BEFORE value update: value={value.device}, latents_j={latents_j.device}")
+
+        # Ensure latents_j is definitely on the target device (redundant but safe)
+        latents_j_update = latents_j.to(unet_device)
+
+        # Increment count for the processed context indices
+        # count shape is [T, 1, H, W], broadcasting works with [context, ...] indexing
+        count[context, ...] += 1
+
+        # --- Blending/Assignment Logic (Modifies 'value' in-place) ---
+        if j == 0:
+            # First context window: direct assignment
+            print(f"[t={t_val}, j={j}] Assigning (j=0): value[{list(context.shape)}] = latents_j[{list(latents_j_update.shape)}]")
+            value[context, ...] = latents_j_update
+        else:
+            # Subsequent windows: blend overlap, assign non-overlap
+            # Find indices within the *current context* that have already been processed (count > 1)
+            # Need to check the count tensor *at the global indices* defined by context
+            # Indexing count[:, 0, 0, 0] is valid for shape [T, 1, H, W]
+            overlap_indices_local = [idx for idx, global_idx in enumerate(context) if count[global_idx, 0, 0, 0] > 1]
+            overlap_len = len(overlap_indices_local)
+
+            if overlap_len > 0:
+                # Calculate blending ratios on the correct device
+                ratio_next = torch.linspace(0, 1, overlap_len + 2, device=unet_device, dtype=latents_j_update.dtype)[1:-1]
+                ratio_pre = 1.0 - ratio_next
+
+                print(f"[t={t_val}, j={j}] Blending {overlap_len} frames...")
+                # Blend the overlapping part
+                for k, local_idx in enumerate(overlap_indices_local):
+                    global_idx = context[local_idx] # Global index in 'value'/'count'
+                    # Ensure parts being blended are on the correct device
+                    value_part = value[global_idx, ...].to(unet_device) # Get existing value
+                    latents_j_part = latents_j_update[local_idx, ...] # Get new value for this index
+                    # Blend: value = value * ratio_pre + latents_j * ratio_next
+                    value[global_idx, ...] = value_part * ratio_pre[k] + latents_j_part * ratio_next[k]
+
+                # Assign the non-overlapping part (overwrite)
+                assign_start_local_idx = overlap_indices_local[-1] + 1
+                if assign_start_local_idx < len(context): # Check if there are non-overlapping frames
+                    print(f"[t={t_val}, j={j}] Assigning non-overlap from local index {assign_start_local_idx}...")
+                    # Get global indices for assignment
+                    assign_global_indices = context[assign_start_local_idx:]
+                    # Get corresponding latents data
+                    assign_latents_data = latents_j_update[assign_start_local_idx:, ...]
+                    value[assign_global_indices, ...] = assign_latents_data
+            else:
+                # No overlap found with previous windows in this timestep
+                print(f"[t={t_val}, j={j}] Assigning full chunk (j>0, no overlap found)...")
+                value[context, ...] = latents_j_update # Assign the whole chunk
+
+        print(f"[t={t_val}, j={j}] Device AFTER value update: value={value.device}")
+        # --- End Update Section ---
+
+        # Return the modified tensors (caller will use them)
+        return value, count
+
     @torch.no_grad()
     def __call__(
         self,
@@ -891,10 +1156,10 @@ class StableDiffusionDiffuEraserPipeline(
                 The prompt or prompts to guide image generation. If not defined, you need to pass `prompt_embeds`.
             images (`torch.FloatTensor`, `PIL.Image.Image`, `np.ndarray`, `List[torch.FloatTensor]`, `List[PIL.Image.Image]`, `List[np.ndarray]`,:
                     `List[List[torch.FloatTensor]]`, `List[List[np.ndarray]]` or `List[List[PIL.Image.Image]]`):
-                The BrushNet branch input condition to provide guidance to the `unet` for generation. 
+                The BrushNet branch input condition to provide guidance to the `unet` for generation. Usually masked images.
             masks (`torch.FloatTensor`, `PIL.Image.Image`, `np.ndarray`, `List[torch.FloatTensor]`, `List[PIL.Image.Image]`, `List[np.ndarray]`,:
                     `List[List[torch.FloatTensor]]`, `List[List[np.ndarray]]` or `List[List[PIL.Image.Image]]`):
-                The BrushNet branch input condition to provide guidance to the `unet` for generation. 
+                The BrushNet branch input condition masks to provide guidance to the `unet` for generation.
             height (`int`, *optional*, defaults to `self.unet.config.sample_size * self.vae_scale_factor`):
                 The height in pixels of the generated image.
             width (`int`, *optional*, defaults to `self.unet.config.sample_size * self.vae_scale_factor`):
@@ -923,13 +1188,13 @@ class StableDiffusionDiffuEraserPipeline(
             latents (`torch.FloatTensor`, *optional*):
                 Pre-generated noisy latents sampled from a Gaussian distribution, to be used as inputs for image
                 generation. Can be used to tweak the same generation with different prompts. If not provided, a latents
-                tensor is generated by sampling using the supplied random `generator`.
+                tensor is generated by sampling using the supplied random `generator`. Shape expected (T, C, H, W).
             prompt_embeds (`torch.FloatTensor`, *optional*):
                 Pre-generated text embeddings. Can be used to easily tweak text inputs (prompt weighting). If not
-                provided, text embeddings are generated from the `prompt` input argument.
+                provided, text embeddings are generated from the `prompt` input argument. Shape [B, Seq, Dim].
             negative_prompt_embeds (`torch.FloatTensor`, *optional*):
                 Pre-generated negative text embeddings. Can be used to easily tweak text inputs (prompt weighting). If
-                not provided, `negative_prompt_embeds` are generated from the `negative_prompt` input argument.
+                not provided, `negative_prompt_embeds` are generated from the `negative_prompt` input argument. Shape [B, Seq, Dim].
             ip_adapter_image: (`PipelineImageInput`, *optional*): Optional image input to work with IP Adapters.
             ip_adapter_image_embeds (`List[torch.FloatTensor]`, *optional*):
                 Pre-generated image embeddings for IP-Adapter. It should be a list of length same as number of IP-adapters.
@@ -937,26 +1202,18 @@ class StableDiffusionDiffuEraserPipeline(
                 if `do_classifier_free_guidance` is set to `True`.
                 If not provided, embeddings are computed from the `ip_adapter_image` input argument.
             output_type (`str`, *optional*, defaults to `"pil"`):
-                The output format of the generated image. Choose between `PIL.Image` or `np.array`.
+                The output format of the generated image. Choose between `PIL.Image` or `np.array` or `pt`.
             return_dict (`bool`, *optional*, defaults to `True`):
                 Whether or not to return a [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] instead of a
                 plain tuple.
-            callback (`Callable`, *optional*):
-                A function that calls every `callback_steps` steps during inference. The function is called with the
-                following arguments: `callback(step: int, timestep: int, latents: torch.FloatTensor)`.
-            callback_steps (`int`, *optional*, defaults to 1):
-                The frequency at which the `callback` function is called. If not specified, the callback is called at
-                every step.
             cross_attention_kwargs (`dict`, *optional*):
-                A kwargs dictionary that if specified is passed along to the [`AttentionProcessor`] as defined in
-                [`self.processor`](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
+                A kwargs dictionary that if specified is passed along to the [`AttentionProcessor`] of the UNet.
             brushnet_conditioning_scale (`float` or `List[float]`, *optional*, defaults to 1.0):
                 The outputs of the BrushNet are multiplied by `brushnet_conditioning_scale` before they are added
-                to the residual in the original `unet`. If multiple BrushNets are specified in `init`, you can set
-                the corresponding scale as a list.
+                to the residual in the original `unet`.
             guess_mode (`bool`, *optional*, defaults to `False`):
-                The BrushNet encoder tries to recognize the content of the input image even if you remove all
-                prompts. A `guidance_scale` value between 3.0 and 5.0 is recommended.
+                In guess mode, the BrushNet encoder tries to recognize the content of the input image even if you remove
+                all prompts. A `guidance_scale` value between 3.0 and 5.0 is recommended.
             control_guidance_start (`float` or `List[float]`, *optional*, defaults to 0.0):
                 The percentage of total steps at which the BrushNet starts applying.
             control_guidance_end (`float` or `List[float]`, *optional*, defaults to 1.0):
@@ -974,16 +1231,12 @@ class StableDiffusionDiffuEraserPipeline(
                 will be passed as `callback_kwargs` argument. You will only be able to include variables listed in the
                 `._callback_tensor_inputs` attribute of your pipeine class.
 
-        Examples:
-
         Returns:
-            [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] or `tuple`:
-                If `return_dict` is `True`, [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] is returned,
-                otherwise a `tuple` is returned where the first element is a list with the generated images and the
-                second element is a list of `bool`s indicating whether the corresponding generated image contains
-                "not-safe-for-work" (nsfw) content.
+            [`~pipelines.diffueraser.pipeline_diffueraser.DiffuEraserPipelineOutput`] or `tuple`:
+                If `return_dict` is `True`, [`~pipelines.diffueraser.pipeline_diffueraser.DiffuEraserPipelineOutput`] is returned,
+                otherwise a `tuple` is returned where the first element is a list with the generated frames.
         """
-
+        # Handle callbacks deprecation
         callback = kwargs.pop("callback", None)
         callback_steps = kwargs.pop("callback_steps", None)
 
@@ -1000,9 +1253,10 @@ class StableDiffusionDiffuEraserPipeline(
                 "Passing `callback_steps` as an input argument to `__call__` is deprecated, consider using `callback_on_step_end`",
             )
 
+        # Get BrushNet module reference
         brushnet = self.brushnet._orig_mod if is_compiled_module(self.brushnet) else self.brushnet
 
-        # align format for control guidance
+        # Align format for control guidance start/end to be lists
         if not isinstance(control_guidance_start, list) and isinstance(control_guidance_end, list):
             control_guidance_start = len(control_guidance_end) * [control_guidance_start]
         elif not isinstance(control_guidance_end, list) and isinstance(control_guidance_start, list):
@@ -1030,6 +1284,7 @@ class StableDiffusionDiffuEraserPipeline(
             callback_on_step_end_tensor_inputs,
         )
 
+        # Set internal attributes used by helper methods/properties
         self._guidance_scale = guidance_scale
         self._clip_skip = clip_skip
         self._cross_attention_kwargs = cross_attention_kwargs
@@ -1040,81 +1295,94 @@ class StableDiffusionDiffuEraserPipeline(
         elif prompt is not None and isinstance(prompt, list):
             batch_size = len(prompt)
         else:
-            batch_size = prompt_embeds.shape[0]
+            # Determine batch size from provided prompt embeddings
+            batch_size = prompt_embeds.shape[0] if prompt_embeds is not None else 1
 
-        device = self._execution_device
+        device = self._execution_device # Get the primary device the pipeline is running on
 
-        global_pool_conditions = (
-            brushnet.config.global_pool_conditions
-            if isinstance(brushnet, BrushNetModel)
-            else brushnet.nets[0].config.global_pool_conditions
-        )
+        # Determine guess mode (defaults to False unless BrushNet uses global pooling)
+        global_pool_conditions = getattr(brushnet.config, "global_pool_conditions", False)
         guess_mode = guess_mode or global_pool_conditions
+        # Get video length from the input list of masked images
         video_length = len(images)
 
         # 3. Encode input prompt
         text_encoder_lora_scale = (
             self.cross_attention_kwargs.get("scale", None) if self.cross_attention_kwargs is not None else None
         )
-        prompt_embeds, negative_prompt_embeds = self.encode_prompt(
+        # Encode positive and negative prompts
+        original_prompt_embeds, original_negative_prompt_embeds = self.encode_prompt(
             prompt,
             device,
             num_images_per_prompt,
-            self.do_classifier_free_guidance,
+            self.do_classifier_free_guidance, # Tells encode_prompt if negative embeds are needed
             negative_prompt,
-            prompt_embeds=prompt_embeds,
-            negative_prompt_embeds=negative_prompt_embeds,
+            prompt_embeds=prompt_embeds, # Pass provided embeds if available
+            negative_prompt_embeds=negative_prompt_embeds, # Pass provided embeds if available
             lora_scale=text_encoder_lora_scale,
             clip_skip=self.clip_skip,
         )
-        # For classifier free guidance, we need to do two forward passes.
-        # Here we concatenate the unconditional and text embeddings into a single batch
-        # to avoid doing two forward passes
-        if self.do_classifier_free_guidance:
-            prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds])
 
+        # Prepare the specific prompt embeddings required by the UNet based on CFG setting
+        if self.do_classifier_free_guidance:
+            prompt_embeds_unet = torch.cat([original_negative_prompt_embeds, original_prompt_embeds])
+        else:
+            prompt_embeds_unet = original_prompt_embeds
+
+        # Prepare IP Adapter embeddings if needed
+        image_embeds = None # Initialize
         if ip_adapter_image is not None or ip_adapter_image_embeds is not None:
             image_embeds = self.prepare_ip_adapter_image_embeds(
                 ip_adapter_image,
                 ip_adapter_image_embeds,
                 device,
-                batch_size * num_images_per_prompt,
+                batch_size * num_images_per_prompt, # Usually batch_size = 1 for video
                 self.do_classifier_free_guidance,
             )
+            # Store IP adapter embeds in added_cond_kwargs for the UNet
+            added_cond_kwargs = {"image_embeds": image_embeds}
+        else:
+            added_cond_kwargs = None # Ensure it's defined
 
-        # 4. Prepare image
+        # 4. Prepare image and mask inputs
         if isinstance(brushnet, BrushNetModel):
-            images = self.prepare_image(
+            # Preprocess the list of masked images (input `images`)
+            prepared_images = self.prepare_image(
                 images=images,
                 width=width,
                 height=height,
                 batch_size=batch_size * num_images_per_prompt,
                 num_images_per_prompt=num_images_per_prompt,
                 device=device,
-                dtype=brushnet.dtype,
-                do_classifier_free_guidance=self.do_classifier_free_guidance,
-                guess_mode=guess_mode,
+                dtype=self.vae.dtype, # Prepare images in VAE dtype for encoding
             )
-            original_masks = self.prepare_image(
+            # Preprocess the list of masks (input `masks`)
+            prepared_masks = self.prepare_image(
                 images=masks,
                 width=width,
                 height=height,
                 batch_size=batch_size * num_images_per_prompt,
                 num_images_per_prompt=num_images_per_prompt,
                 device=device,
-                dtype=brushnet.dtype,
-                do_classifier_free_guidance=self.do_classifier_free_guidance,
-                guess_mode=guess_mode,
+                dtype=torch.float32, # Prepare masks as float for processing
             )
-            original_masks_new = []
-            for original_mask in original_masks:
-                original_mask=(original_mask.sum(1)[:,None,:,:] < 0).to(images[0].dtype) 
-                original_masks_new.append(original_mask)
-            original_masks = original_masks_new
-            
-            height, width = images[0].shape[-2:]
+
+            # Convert prepared masks to binary single channel format
+            # Create INVERTED mask (0=masked, 1=background)
+            inverted_masks_new = []
+            for processed_mask_tensor in prepared_masks:
+                 # Assuming input mask [0, 255] maps to [0, 1] in prepare_image.
+                 # We want 0 where the mask is present (> threshold), and 1 otherwise.
+                 inverted_binary_mask = (processed_mask_tensor.sum(dim=1, keepdim=True) < 1e-5).to(processed_mask_tensor.dtype)
+                 inverted_masks_new.append(inverted_binary_mask)
+            prepared_masks_processed = inverted_masks_new # List of [B, 1, H, W] tensors (0=masked, 1=background)
+
+            # Get final height/width from prepared tensors
+            # Use height/width determined by prepare_image if not provided initially
+            height, width = prepared_images[0].shape[-2:]
         else:
-            assert False
+            raise ValueError("BrushNet model not found or is not the expected type.")
+
 
         # 5. Prepare timesteps
         timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, num_inference_steps, device, timesteps)
@@ -1122,46 +1390,49 @@ class StableDiffusionDiffuEraserPipeline(
 
         # 6. Prepare latent variables
         num_channels_latents = self.unet.config.in_channels
-        latents, noise = self.prepare_latents(
-            batch_size * num_images_per_prompt,
-            num_channels_latents,
-            num_frames,
-            height,
-            width,
-            prompt_embeds.dtype,
-            device,
-            generator,
-            latents,
-        )
+        latent_height, latent_width = height // self.vae_scale_factor, width // self.vae_scale_factor
+        # Target shape for latents within the loop: (T, C, H_lat, W_lat)
+        latents_shape_for_loop = (video_length, num_channels_latents, latent_height, latent_width)
 
-        # 6.1 prepare condition latents
-        images = torch.cat(images)
-        images = images.to(dtype=prompt_embeds.dtype) # Match prompt embed dtype
+        if latents is None:
+            print(f"--- Generating initial noise for shape (T,C,H,W): {latents_shape_for_loop} ---")
+            # Ensure noise dtype matches the expected input dtype for the UNet
+            noise_dtype = prompt_embeds_unet.dtype
+            noise = randn_tensor(latents_shape_for_loop, generator=generator, device=device, dtype=noise_dtype)
+            # Scale the initial noise by the scheduler's sigma
+            latents = noise * self.scheduler.init_noise_sigma
+        else:
+            # Use provided latents
+            print(f"--- Using provided latents, shape: {latents.shape} ---")
+            # Ensure provided latents are on the correct device and dtype
+            latents = latents.to(device=device, dtype=prompt_embeds_unet.dtype)
+            if latents.shape != latents_shape_for_loop:
+                 print(f"Warning: Provided latents shape {latents.shape} does not match expected {latents_shape_for_loop}. Reshaping or errors might occur.")
+            # No noise scaling needed if latents are provided (assumed to be already noisy)
 
-        # --- START OPTIMIZATION 2: Reduce VAE Batch Size & Offload ---
-        conditioning_latents = []
-        num_vae_batch_cond = 1 # Use 1 or 2 for lower VRAM peak
+
+        # 6.1 Prepare condition latents (VAE encode masked images)
+        # Concatenate the list of prepared images [B, C, H, W] into single tensor [T, C, H, W] (assuming B=1)
+        images_cat = torch.cat(prepared_images, dim=0) # Already in vae.dtype
+
+        # --- VAE Encoding (Optimized) ---
+        conditioning_latents_list = [] # Use list for intermediate CPU storage
+        num_vae_batch_cond = 4 # Adjust based on VRAM
         print(f"--- Preparing conditioning latents using VAE batch size {num_vae_batch_cond} ---")
-        vae_original_device_cond = self.vae.device # Store original VAE device
+        vae_original_device_cond = self.vae.device
         cpu_device = torch.device("cpu")
         try:
-            # Ensure VAE is on the pipeline's execution device for encoding
-            self.vae.to(device)
+            self.vae.to(device) # Move VAE to computation device
             print(f"--- Moved VAE to {device} for conditioning latent encoding ---")
             with torch.no_grad():
-                 for i in range(0, images.shape[0], num_vae_batch_cond):
-                     # Process one batch at a time, ensure correct dtype
-                     batch_images_cond = images[i : i + num_vae_batch_cond].to(dtype=self.vae.dtype)
-                     # Encode
+                 for i_vae in range(0, images_cat.shape[0], num_vae_batch_cond):
+                     batch_images_cond = images_cat[i_vae : i_vae + num_vae_batch_cond] # Already correct dtype
                      encoded_latent_dist = self.vae.encode(batch_images_cond).latent_dist
-                     # Sample and immediately move to CPU
-                     conditioning_latents.append(encoded_latent_dist.sample().to(cpu_device))
-                     # Optional: Print progress less frequently
-                     # if i % (num_vae_batch_cond * 20) == 0:
-                     #     print(f"--- VAE encoded conditioning batch up to frame {i + len(batch_images_cond)} ---")
+                     # Sample latents and move to CPU immediately
+                     conditioning_latents_list.append(encoded_latent_dist.sample().to(cpu_device))
 
             # Concatenate all intermediate latents on the CPU
-            conditioning_latents = torch.cat(conditioning_latents, dim=0)
+            conditioning_latents = torch.cat(conditioning_latents_list, dim=0)
             print(f"--- Concatenated conditioning latents on CPU, shape: {conditioning_latents.shape} ---")
             # Move the final, full tensor to the GPU
             conditioning_latents = conditioning_latents.to(device)
@@ -1171,128 +1442,114 @@ class StableDiffusionDiffuEraserPipeline(
             # Return VAE to its original device (important if offloading is used)
             self.vae.to(vae_original_device_cond)
             print(f"--- Returned VAE to {vae_original_device_cond} ---")
+            del conditioning_latents_list # Clear intermediate list from memory
             # Explicitly clear cache after potential large tensor operations and moves
             if torch.cuda.is_available(): torch.cuda.empty_cache()
             gc.collect()
-        # --- END OPTIMIZATION 2 ---
+        # --- End VAE Encoding ---
 
-        conditioning_latents = conditioning_latents * self.vae.config.scaling_factor # Apply scaling factor
+        # Apply VAE scaling factor
+        conditioning_latents = conditioning_latents * self.vae.config.scaling_factor
 
-        # --- Clean up intermediate image tensor ---
-        print(f"--- Deleting intermediate 'images' tensor (shape: {images.shape}) ---")
-        del images
+        # Clean up VAE input images tensor
+        print(f"--- Deleting intermediate 'images_cat' tensor (shape: {images_cat.shape}) ---")
+        del images_cat, prepared_images # Delete concatenated tensor and the list
         if torch.cuda.is_available(): torch.cuda.empty_cache()
         gc.collect()
-        # ---
 
-        original_masks = torch.cat(original_masks)
-        masks = torch.nn.functional.interpolate(
-            original_masks,
-            size=(
-                latents.shape[-2], # Target latent height
-                latents.shape[-1]  # Target latent width
-            )
-        ) ## [f c h w], c=1
+        # Prepare masks for concatenation with conditioning latents
+        # Concatenate the list of prepared *inverted* masks [B, 1, H, W] -> [T, 1, H, W]
+        inverted_masks_cat = torch.cat(prepared_masks_processed, dim=0)
+        # Interpolate masks to latent dimensions (H_lat, W_lat)
+        masks_interp = torch.nn.functional.interpolate(
+            inverted_masks_cat,
+            size=(latent_height, latent_width)
+        ) ## [T, 1, H_lat, W_lat] (0=masked, 1=background)
 
-        # --- Clean up original_masks tensor ---
-        print(f"--- Deleting intermediate 'original_masks' tensor (shape: {original_masks.shape}) ---")
-        del original_masks
+        # Clean up original size masks tensor
+        print(f"--- Deleting intermediate 'inverted_masks_cat' tensor (shape: {inverted_masks_cat.shape}) ---")
+        del inverted_masks_cat, prepared_masks_processed # Delete concatenated tensor and the list
         if torch.cuda.is_available(): torch.cuda.empty_cache()
         gc.collect()
-        # ---
 
-        # Concatenate conditioning latents and masks
-        # Ensure mask is on the same device and matches dtype if needed
-        conditioning_latents = torch.concat([conditioning_latents, masks.to(conditioning_latents.device, dtype=conditioning_latents.dtype)], dim=1)
-        print(f"--- Final conditioning_latents shape (incl. mask): {conditioning_latents.shape} on {conditioning_latents.device} ---")
+        # Concatenate VAE latents and interpolated *inverted* masks -> [T, C+1, H_lat, W_lat]
+        # Ensure interpolated masks are on the same device and dtype as conditioning_latents
+        conditioning_latents = torch.cat([
+            conditioning_latents,
+            masks_interp.to(conditioning_latents.device, dtype=conditioning_latents.dtype)
+        ], dim=1)
+        print(f"--- Final conditioning_latents shape (incl. INVERTED mask): {conditioning_latents.shape} on {conditioning_latents.device} ---")
 
-        # --- Clean up masks tensor ---
-        print(f"--- Deleting intermediate 'masks' tensor (shape: {masks.shape}) ---")
-        del masks
+        # Clean up interpolated masks tensor
+        print(f"--- Deleting intermediate 'masks_interp' tensor (shape: {masks_interp.shape}) ---")
+        del masks_interp
         if torch.cuda.is_available(): torch.cuda.empty_cache()
         gc.collect()
-        # ---
 
-        # 6.5 Optionally get Guidance Scale Embedding
+
+        # 6.5 Optionally get Guidance Scale Embedding for LCM/SCM schedulers
         timestep_cond = None
         if self.unet.config.time_cond_proj_dim is not None:
             guidance_scale_tensor = torch.tensor(self.guidance_scale - 1).repeat(batch_size * num_images_per_prompt)
+            # Ensure embedding dtype matches latent dtype
             timestep_cond = self.get_guidance_scale_embedding(
                 guidance_scale_tensor, embedding_dim=self.unet.config.time_cond_proj_dim
             ).to(device=device, dtype=latents.dtype)
 
-        # 7. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
+
+        # 7. Prepare extra step kwargs for scheduler
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
-        # 7.1 Add image embeds for IP-Adapter
-        added_cond_kwargs = (
-            {"image_embeds": image_embeds}
-            if ip_adapter_image is not None or ip_adapter_image_embeds is not None
-            else None
-        )
+        # 7.1 Added condition kwargs (already prepared with IP adapter check)
 
-        # 7.2 Create tensor stating which brushnets to keep
+        # 7.2 Create tensor stating which brushnets to keep active during inference steps
         brushnet_keep = []
-        for i in range(len(timesteps)):
+        for i_keep in range(len(timesteps)):
             keeps = [
-                1.0 - float(i / len(timesteps) < s or (i + 1) / len(timesteps) > e)
+                1.0 - float(i_keep / len(timesteps) < s or (i_keep + 1) / len(timesteps) > e)
                 for s, e in zip(control_guidance_start, control_guidance_end)
             ]
+            # Assuming only one BrushNet, take the first element
             brushnet_keep.append(keeps[0] if isinstance(brushnet, BrushNetModel) else keeps)
 
 
-        overlap = num_frames//4
+        # Prepare context lists and scheduler states for sliding window approach
+        overlap = num_frames // 4 # Calculate overlap based on context window size
         context_list, context_list_swap = get_frames_context_swap(video_length, overlap=overlap, num_frames_per_clip=num_frames)
+        # Store initial scheduler state to restore for each context window
         scheduler_status = [copy.deepcopy(self.scheduler.__dict__)] * len(context_list)
         scheduler_status_swap = [copy.deepcopy(self.scheduler.__dict__)] * len(context_list_swap)
-        count = torch.zeros_like(latents)
-        value = torch.zeros_like(latents)
-        
+
+        # Initialize accumulators for blending results across context windows
+        value = torch.zeros_like(latents) # Accumulates processed latents, shape (T, C, H_lat, W_lat)
+        # Use single channel for count to save memory, shape (T, 1, H_lat, W_lat)
+        count = torch.zeros_like(latents[:, 0:1, :, :])
+
 
         # 8. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+        # Check if models are compiled
         is_unet_compiled = is_compiled_module(self.unet)
         is_brushnet_compiled = is_compiled_module(self.brushnet)
         is_torch_higher_equal_2_1 = is_torch_version(">=", "2.1")
 
-        # --- OPTIMIZATION 3: Prepare device variables ---
-        # Define the TARGET computation device explicitly (usually the device the pipeline was moved to)
-        # Use self._execution_device if available and correct, otherwise fallback to self.device
-        if hasattr(self, '_execution_device'):
-            target_device = self._execution_device
-        elif hasattr(self, 'device'):
-             target_device = self.device
-        else:
-             # Fallback: try to get from a module we know should be on GPU if possible, or default to cuda:0
-             try:
-                 target_device = next(self.unet.parameters()).device if next(self.unet.parameters(), None) is not None else torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-             except StopIteration: # Handle case where model has no parameters
-                 target_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        # Determine target devices
+        unet_device = device # Use the main pipeline device for computation
+        cpu_device = torch.device("cpu") # Use CPU for temporary offloading
+        print(f"--- Device Setup: Target Computation Device = {unet_device}, CPU on {cpu_device} ---")
 
 
-        if not torch.cuda.is_available() and target_device.type == 'cuda':
-            print("Warning: CUDA specified as target device, but CUDA is not available. Falling back to CPU.")
-            target_device = torch.device("cpu")
-
-        # Use this single target_device for all GPU operations within the loop
-        unet_device = target_device  # Rename for consistency with existing code, or replace usages
-        cpu_device = torch.device("cpu")
-        # Log the intended computation device and the initial states
-        print(f"--- Device Setup: Target Computation Device = {unet_device}, Initial UNet on {self.unet.device}, Initial BrushNet on {self.brushnet.device}, CPU on {cpu_device} ---")
-        # ---
-
+        # Start denoising loop
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
 
-                # --- Zero count and value at the START of each timestep i ---
-                count.zero_()
+                # Zero accumulators and ensure they are on the computation device at the start of each timestep
                 value.zero_()
-                # Ensure they remain on the correct device
+                count.zero_()
                 value = value.to(unet_device)
                 count = count.to(unet_device)
-                # ---
 
-                ## Choose context list based on swap logic
+                # Choose context list based on swapping logic (alternating context starts)
                 if (i % 2 == 1):
                     context_list_choose = context_list_swap
                     scheduler_status_choose = scheduler_status_swap
@@ -1300,26 +1557,27 @@ class StableDiffusionDiffuEraserPipeline(
                     context_list_choose = context_list
                     scheduler_status_choose = scheduler_status
 
-                # <<< START OF REFACTORED LOOP >>>
+                # --- Inner loop processing context windows ---
                 for j, context in enumerate(context_list_choose):
-                    # Get the slice of latents for the current context
-                    # Important: Pass the *original* latents tensor from the outer loop
-                    current_latents_context = latents[context, :, :, :]
+                    # Get the slice of latents for the current context window
+                    # Use the 'latents' from the *start* of timestep i
+                    current_latents_for_context = latents[context, :, :, :]
 
                     # Call the helper method to process this context window
+                    # This method modifies 'value' and 'count' in-place via blending/assignment
                     value, count = self._process_context_step(
                         j=j,
                         context=context,
                         scheduler_state=scheduler_status_choose[j],
-                        current_latents=current_latents_context, # Pass the sliced latents
-                        value=value,     # Pass current accumulated value
-                        count=count,     # Pass current accumulated count
-                        t=t,
-                        i=i,
+                        current_latents_context=current_latents_for_context, # Pass the slice
+                        value=value,     # Pass current accumulated value tensor
+                        count=count,     # Pass current accumulated count tensor
+                        t=t,             # Current timestep
+                        i=i,             # Outer loop index
                         unet_device=unet_device,
                         cpu_device=cpu_device,
-                        prompt_embeds=prompt_embeds, # Pass the full embeds
-                        conditioning_latents=conditioning_latents,
+                        original_prompt_embeds=prompt_embeds_unet, # Pass the correctly prepared UNet embeds
+                        conditioning_latents=conditioning_latents, # Pass the VAE encoded + *inverted* mask tensor
                         timestep_cond=timestep_cond,
                         brushnet_keep=brushnet_keep,
                         brushnet_conditioning_scale=brushnet_conditioning_scale,
@@ -1330,332 +1588,99 @@ class StableDiffusionDiffuEraserPipeline(
                         extra_step_kwargs=extra_step_kwargs,
                         added_cond_kwargs=added_cond_kwargs,
                     )
-                # <<< END OF REFACTORED LOOP >>>
+                # --- End inner context loop ---
 
-                # --- Update latents for the next timestep using the accumulated 'value' ---
-                # Normalize value where count is > 0 to avoid division by zero
-                # Create a mask for where count is zero
-                count_mask = count > 0
-                # Use torch.where to safely divide or keep original value (or zero)
-                # We divide value by count where count > 0, otherwise keep value as is (which should be 0)
-                # Then clone the result to latents for the next step.
-                latents = torch.where(count_mask, value / count, value).clone()
-                print(f"--- Updated latents tensor for next step, shape: {latents.shape} on {latents.device} ---")
+                # --- Update latents for the next timestep ---
+                # The accumulated results are in 'value'. Clone it for the next iteration.
+                # Revert to original logic: simply clone the accumulated value.
+                latents = value.clone()
+                # Log the update
+                print(f"--- Updated latents tensor for next step (cloned from value), shape: {latents.shape} on {latents.device} ---")
                 # ---
 
+                # --- Handle callbacks ---
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
+                    # Populate callback_kwargs carefully, ensuring variables exist
+                    local_vars = locals()
                     for k in callback_on_step_end_tensor_inputs:
-                        callback_kwargs[k] = locals()[k]
+                         # Prioritize local variables, then instance attributes
+                         if k in local_vars:
+                             callback_kwargs[k] = local_vars[k]
+                         elif hasattr(self, k):
+                             callback_kwargs[k] = getattr(self, k)
+                         # Add specific important variables if not covered but needed by callback
+                         elif k == 'prompt_embeds': # If callback expects 'prompt_embeds' specifically
+                             callback_kwargs[k] = prompt_embeds_unet
+
+                    # Call the callback function
                     callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
 
+                    # Update pipeline state based on callback output (if provided)
                     latents = callback_outputs.pop("latents", latents)
-                    prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
-                    negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
+                    # Allow callback to potentially modify prompt embeds (use with caution)
+                    # prompt_embeds_unet = callback_outputs.pop("prompt_embeds", prompt_embeds_unet)
 
-                # Update progress bar
+                # Update progress bar based on scheduler order
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
+                    # Handle legacy callback
+                    if callback is not None and i % callback_steps == 0:
+                         step_idx = i // getattr(self.scheduler, "order", 1)
+                         callback(step_idx, t, latents) # Pass current latents
 
 
-        # If we do sequential model offloading, let's offload unet and brushnet
-        # manually for max memory savings
+        # --- End Denoising Loop ---
+
+        # Offload models if sequential offloading is enabled
         if hasattr(self, "final_offload_hook") and self.final_offload_hook is not None:
-            self.unet.to("cpu")
-            self.brushnet.to("cpu")
-            torch.cuda.empty_cache()
+             print("--- Offloading UNet and BrushNet ---")
+             self.unet.to("cpu")
+             self.brushnet.to("cpu")
+             torch.cuda.empty_cache()
 
-        # --- OPTIMIZATION 3g: Final GC before returning ---
+        # Final garbage collection
         print("--- Final garbage collection before returning from pipeline __call__ ---")
         gc.collect()
         if torch.cuda.is_available(): torch.cuda.empty_cache()
-        # ---
 
+        # --- Prepare Output ---
         if output_type == "latent":
-            # No need to decode VAE, return the computed latents directly
-            # Assign the final latents tensor to the 'latents' field of the output object.
-            # Set 'frames' to None as we are not decoding.
-            print("--- Returning latents directly (output_type='latent') ---") # Optional: Add log
-            return DiffuEraserPipelineOutput(frames=None, latents=latents) # <<< CORRECTED RETURN
-
-        # --- Code for output_type != "latent" ---
-        print(f"--- Decoding final latents to output_type='{output_type}' ---") # Optional: Add log
-        video_tensor = self.decode_latents(latents, weight_dtype=prompt_embeds.dtype) # VAE Decode happens here
-
-        if output_type == "pt":
-            video = video_tensor
+             # Return latents directly without decoding
+             print("--- Returning latents directly (output_type='latent') ---")
+             output = DiffuEraserPipelineOutput(frames=None, latents=latents)
         else:
-            # Ensure postprocess handles pt input correctly
-            video = self.image_processor.postprocess(video_tensor, output_type=output_type)
+             # Decode latents to video frames
+             print(f"--- Decoding final latents to output_type='{output_type}' ---")
+             # Ensure decoder uses a compatible dtype (usually VAE's dtype)
+             decode_dtype = self.vae.dtype
+             # Handle cases where latents might be float32 but VAE prefers float16/bfloat16
+             if latents.dtype != decode_dtype and not torch.backends.mps.is_available(): # Avoid cast on MPS if types differ significantly
+                print(f"--- Casting latents from {latents.dtype} to {decode_dtype} for VAE decoding ---")
+                latents_for_decode = latents.to(decode_dtype)
+             else:
+                latents_for_decode = latents
 
-        # Offload all models if needed (maybe_free_model_hooks likely handles offloaded models)
+             video_tensor = self.decode_latents(latents_for_decode, weight_dtype=decode_dtype)
+
+             # Postprocess video tensor to requested format (PIL, np, etc.)
+             if output_type == "pt":
+                 video = video_tensor
+             else:
+                 video = self.image_processor.postprocess(video_tensor, output_type=output_type)
+
+             # Create output object, including final latents even if frames are returned
+             output = DiffuEraserPipelineOutput(frames=video, latents=latents)
+
+
+        # Potentially free model hooks (related to offloading)
         self.maybe_free_model_hooks()
 
+        # Return based on return_dict setting
         if not return_dict:
-            # Original code had 'has_nsfw_concept' here, but safety checker is likely off.
-            # Return only the video frames/tensor in a tuple.
-            return (video,)
-
-        # Return the standard output object for non-latent types
-        print("--- Returning decoded frames and final latents ---") # Optional: Add log
-        return DiffuEraserPipelineOutput(frames=video, latents=latents)
-
-
-    def _process_context_step(
-        self,
-        j: int,
-        context: np.ndarray, # Or torch.Tensor depending on context_list type
-        scheduler_state: Dict,
-        current_latents: torch.Tensor, # Input latents for this context
-        value: torch.Tensor, # Accumulated results tensor (modified in-place or returned)
-        count: torch.Tensor, # Accumulated counts tensor (modified in-place or returned)
-        t: Union[torch.Tensor, int], # Current timestep
-        i: int, # Outer loop index (for brushnet_keep)
-        unet_device: torch.device,
-        cpu_device: torch.device,
-        prompt_embeds: torch.Tensor,
-        conditioning_latents: torch.Tensor,
-        timestep_cond: Optional[torch.Tensor],
-        brushnet_keep: List,
-        brushnet_conditioning_scale: Union[float, List[float]],
-        guess_mode: bool,
-        is_unet_compiled: bool,
-        is_brushnet_compiled: bool,
-        is_torch_higher_equal_2_1: bool,
-        extra_step_kwargs: Dict,
-        added_cond_kwargs: Optional[Dict],
-    ) -> Tuple[torch.Tensor, torch.Tensor]: # Returns updated value, count
-        """
-        Processes a single context window (j) within a denoising timestep (t).
-
-        Args:
-            j: Index of the current context window.
-            context: Indices of frames within the current context window.
-            scheduler_state: Saved state of the scheduler for this context.
-            current_latents: The slice of latents corresponding to the current context.
-            value: The tensor accumulating the results across context windows.
-            count: The tensor counting how many times each latent has been processed.
-            t: The current timestep.
-            i: The index of the current timestep in the main loop.
-            unet_device: The target device for computation (GPU).
-            cpu_device: The CPU device.
-            prompt_embeds: Text embeddings (potentially cfg-concatenated).
-            conditioning_latents: Pre-computed conditioning latents (masked images + masks).
-            timestep_cond: Optional timestep conditioning embeddings.
-            brushnet_keep: List indicating whether BrushNet is active.
-            brushnet_conditioning_scale: Scaling factor for BrushNet output.
-            guess_mode: Whether to use guess mode for BrushNet.
-            is_unet_compiled: Flag indicating if UNet is compiled.
-            is_brushnet_compiled: Flag indicating if BrushNet is compiled.
-            is_torch_higher_equal_2_1: Flag indicating PyTorch version >= 2.1.
-            extra_step_kwargs: Extra arguments for the scheduler step.
-            added_cond_kwargs: Additional conditioning arguments (e.g., for IP-Adapter).
-
-        Returns:
-            A tuple containing the updated value and count tensors.
-        """
-        # Restore scheduler state for this context window
-        self.scheduler.__dict__.update(scheduler_state)
-
-        # latents_j should be on the main device (unet_device)
-        # Note: current_latents is passed in already sliced.
-        latents_j = current_latents.to(unet_device)
-
-        # Relevant thread:
-        # https://dev-discuss.pytorch.org/t/cudagraphs-in-pytorch-2-0/1428
-        if (is_unet_compiled and is_brushnet_compiled) and is_torch_higher_equal_2_1:
-            torch._inductor.cudagraph_mark_step_begin()
-
-        # expand the latents if we are doing classifier free guidance
-        latent_model_input = torch.cat([latents_j] * 2) if self.do_classifier_free_guidance else latents_j
-        latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
-
-        # Prepare inputs for BrushNet based on guess_mode and cfg
-        if guess_mode and self.do_classifier_free_guidance:
-            # Infer BrushNet only for the conditional batch.
-            control_model_input = latents_j # No need to repeat here
-            control_model_input = self.scheduler.scale_model_input(control_model_input, t)
-            brushnet_prompt_embeds = prompt_embeds.chunk(2)[1]
-            # Rearrange positive prompts for the context length
-            brushnet_prompt_embeds = rearrange(repeat(brushnet_prompt_embeds, "b c d -> b t c d", t=len(context)), 'b t c d -> (b t) c d')
+             # Return only the frames/video (or None if output_type was latent)
+             return (output.frames,)
         else:
-            control_model_input = latent_model_input
-            brushnet_prompt_embeds = prompt_embeds
-            # Adapt prompt embedding repeating based on context length if needed
-            if self.do_classifier_free_guidance:
-                neg_brushnet_prompt_embeds, pos_brushnet_prompt_embeds = brushnet_prompt_embeds.chunk(2)
-                pos_brushnet_prompt_embeds = rearrange(repeat(pos_brushnet_prompt_embeds, "b c d -> b t c d", t=len(context)), 'b t c d -> (b t) c d')
-                neg_brushnet_prompt_embeds = rearrange(repeat(neg_brushnet_prompt_embeds, "b c d -> b t c d", t=len(context)), 'b t c d -> (b t) c d')
-                brushnet_prompt_embeds = torch.cat([neg_brushnet_prompt_embeds, pos_brushnet_prompt_embeds])
-            else:
-                brushnet_prompt_embeds = rearrange(repeat(brushnet_prompt_embeds, "b c d -> b t c d", t=len(context)), 'b t c d -> (b t) c d')
-
-        # Determine BrushNet conditioning scale for this step
-        if isinstance(brushnet_keep[i], list):
-            cond_scale = [c * s for c, s in zip(brushnet_conditioning_scale, brushnet_keep[i])]
-        else:
-            brushnet_cond_scale = brushnet_conditioning_scale
-            if isinstance(brushnet_cond_scale, list):
-                brushnet_cond_scale = brushnet_cond_scale[0]
-            cond_scale = brushnet_cond_scale * brushnet_keep[i]
-
-        # --- BrushNet Inference & Offload ---
-        self.brushnet.to(unet_device)
-        print(f"[t={t if isinstance(t, int) else t.item()}, j={j}] Running BrushNet on {unet_device}...")
-
-        control_model_input_gpu = control_model_input.to(unet_device)
-        brushnet_prompt_embeds_gpu = brushnet_prompt_embeds.to(unet_device)
-        brushnet_cond_indices = context
-        brushnet_cond_sliced = conditioning_latents[brushnet_cond_indices, :, :, :]
-        brushnet_cond_input = torch.cat([brushnet_cond_sliced]*2) if self.do_classifier_free_guidance else brushnet_cond_sliced
-        brushnet_cond_input_gpu = brushnet_cond_input.to(unet_device)
-
-        down_block_res_samples, mid_block_res_sample, up_block_res_samples = self.brushnet(
-            control_model_input_gpu,
-            t,
-            encoder_hidden_states=brushnet_prompt_embeds_gpu,
-            brushnet_cond=brushnet_cond_input_gpu,
-            conditioning_scale=cond_scale,
-            guess_mode=guess_mode,
-            return_dict=False,
-        )
-
-        print(f"[t={t if isinstance(t, int) else t.item()}, j={j}] Moving BrushNet results to CPU...")
-        down_block_res_samples_cpu = [res.to(cpu_device) for res in down_block_res_samples]
-        mid_block_res_sample_cpu = mid_block_res_sample.to(cpu_device)
-        up_block_res_samples_cpu = [res.to(cpu_device) for res in up_block_res_samples]
-
-        del down_block_res_samples, mid_block_res_sample, up_block_res_samples
-        del control_model_input_gpu, brushnet_prompt_embeds_gpu, brushnet_cond_input_gpu, brushnet_cond_sliced
-        if torch.cuda.is_available(): torch.cuda.empty_cache()
-        print(f"[t={t if isinstance(t, int) else t.item()}, j={j}] Cleared BrushNet GPU tensors.")
-
-        if guess_mode and self.do_classifier_free_guidance:
-            print(f"[t={t if isinstance(t, int) else t.item()}, j={j}] Applying guess mode logic on CPU...")
-            down_block_res_samples_cpu = [torch.cat([torch.zeros_like(d), d]) for d in down_block_res_samples_cpu]
-            mid_block_res_sample_cpu = torch.cat([torch.zeros_like(mid_block_res_sample_cpu), mid_block_res_sample_cpu])
-            up_block_res_samples_cpu = [torch.cat([torch.zeros_like(d), d]) for d in up_block_res_samples_cpu]
-
-        # --- Move results back for UNet ---
-        print(f"[t={t if isinstance(t, int) else t.item()}, j={j}] Moving BrushNet results back to {unet_device} for UNet...")
-        down_block_add_samples_gpu = [res.to(unet_device) for res in down_block_res_samples_cpu]
-        mid_block_add_sample_gpu = mid_block_res_sample_cpu.to(unet_device)
-        up_block_add_samples_gpu = [res.to(unet_device) for res in up_block_res_samples_cpu]
-
-        del down_block_res_samples_cpu, mid_block_res_sample_cpu, up_block_res_samples_cpu
-        print(f"[t={t if isinstance(t, int) else t.item()}, j={j}] Cleared BrushNet CPU tensors.")
-        # --- End BrushNet Section ---
-
-
-        # --- UNet Inference ---
-        self.unet.to(unet_device)
-        print(f"[t={t if isinstance(t, int) else t.item()}, j={j}] Running UNet on {unet_device}...")
-        latent_model_input_gpu = latent_model_input.to(unet_device)
-        # Adjust prompt embeds shape for UNet call (expects B C D, not (B*T) C D)
-        # If CFG, it expects 2*B C D
-        unet_prompt_embeds_gpu = prompt_embeds.to(unet_device) # Use original prompt_embeds
-        timestep_cond_gpu = timestep_cond.to(unet_device) if timestep_cond is not None else None
-
-        noise_pred = self.unet(
-            latent_model_input_gpu, # Should have shape (2*T, C, H, W) or (T, C, H, W)
-            t,
-            encoder_hidden_states=unet_prompt_embeds_gpu, # Should have shape (2*B, Seq, Dim) or (B, Seq, Dim)
-            timestep_cond=timestep_cond_gpu,
-            cross_attention_kwargs=self.cross_attention_kwargs,
-            down_block_add_samples=down_block_add_samples_gpu,
-            mid_block_add_sample=mid_block_add_sample_gpu,
-            up_block_add_samples=up_block_add_samples_gpu,
-            added_cond_kwargs=added_cond_kwargs,
-            return_dict=False,
-            num_frames=len(context), # Pass the length of the current context
-        )[0] # noise_pred should have shape (2*T, C, H, W) or (T, C, H, W)
-
-        print(f"[t={t if isinstance(t, int) else t.item()}, j={j}] Deleting UNet inputs and BrushNet GPU results...")
-        del down_block_add_samples_gpu, mid_block_add_sample_gpu, up_block_add_samples_gpu
-        del latent_model_input_gpu, unet_prompt_embeds_gpu
-        if torch.cuda.is_available(): torch.cuda.empty_cache()
-        # --- End UNet Section ---
-
-        # Perform guidance
-        if self.do_classifier_free_guidance:
-            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-            noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
-            del noise_pred_uncond, noise_pred_text # Delete chunks
-
-        # Scheduler step
-        current_latents_device = latents_j.device
-        noise_pred_device = noise_pred.device
-        t_device = t.device if torch.is_tensor(t) else 'builtin' # Timestep device
-        print(f"[t={t if isinstance(t, int) else t.item()}, j={j}] Devices BEFORE scheduler step: latents_j={current_latents_device}, noise_pred={noise_pred_device}, t={t_device}")
-
-        noise_pred_step = noise_pred.to(unet_device)
-        latents_j_step = latents_j.to(unet_device)
-
-        if not torch.is_tensor(t):
-            t_step = torch.tensor([t], device=unet_device, dtype=torch.long)
-        else:
-            t_step = t.to(device=unet_device, dtype=torch.long)
-
-        print(f"[t={t if isinstance(t, int) else t.item()}, j={j}] Devices AFTER explicit .to(unet_device): latents_j={latents_j_step.device}, noise_pred={noise_pred_step.device}, t={t_step.device}")
-
-        try:
-            latents_j_out = self.scheduler.step(
-                noise_pred_step,
-                t_step.squeeze(), # Ensure t_step is scalar or 1D for scheduler
-                latents_j_step,
-                **extra_step_kwargs,
-                return_dict=False
-            )[0]
-        except RuntimeError as e:
-            print(f"ERROR during scheduler.step: {e}")
-            print(f"Device Check: noise_pred={noise_pred_step.device}, t={t_step.device}, latents={latents_j_step.device}")
-            raise e
-
-        del noise_pred, noise_pred_step, latents_j_step
-        if torch.cuda.is_available(): torch.cuda.empty_cache()
-
-        latents_j = latents_j_out # Result is on unet_device
-
-        # --- Update accumulated value and count tensors ---
-        value_device_before_update = value.device
-        latents_j_device_before_update = latents_j.device
-        print(f"[t={t if isinstance(t, int) else t.item()}, j={j}] Devices BEFORE value update: value={value_device_before_update}, latents_j={latents_j_device_before_update}")
-
-        latents_j_update = latents_j.to(unet_device) # Ensure on correct device
-
-        # Update count (count should already be on unet_device)
-        count[context, ...] += 1
-
-        # Blend/Assign logic
-        if j == 0:
-            print(f"[t={t if isinstance(t, int) else t.item()}, j={j}] Assigning (j=0): value[{list(context.shape)}] = latents_j[{list(latents_j_update.shape)}]")
-            value[context, ...] = latents_j_update
-        else:
-            overlap_indices_local = [idx for idx, count_val in enumerate(count[context, 0, 0, 0]) if count_val > 1]
-            overlap_len = len(overlap_indices_local)
-            if overlap_len > 0:
-                ratio_next = torch.linspace(0, 1, overlap_len + 2, device=unet_device, dtype=latents_j_update.dtype)[1:-1]
-                ratio_pre = 1.0 - ratio_next
-
-                print(f"[t={t if isinstance(t, int) else t.item()}, j={j}] Blending {overlap_len} frames...")
-                for k, local_idx in enumerate(overlap_indices_local):
-                    global_idx = context[local_idx]
-                    value_part = value[global_idx, ...].to(unet_device)
-                    latents_j_part = latents_j_update[local_idx, ...]
-                    value[global_idx, ...] = value_part * ratio_pre[k] + latents_j_part * ratio_next[k]
-
-                assign_start_local_idx = overlap_indices_local[-1] + 1
-                if assign_start_local_idx < len(context):
-                    print(f"[t={t if isinstance(t, int) else t.item()}, j={j}] Assigning non-overlap from index {assign_start_local_idx}...")
-                    value[context[assign_start_local_idx:], ...] = latents_j_update[assign_start_local_idx:, ...]
-            else: # No overlap found
-                print(f"[t={t if isinstance(t, int) else t.item()}, j={j}] Assigning full chunk (j>0, no overlap found)...")
-                value[context, ...] = latents_j_update
-
-        value_device_after_update = value.device
-        print(f"[t={t if isinstance(t, int) else t.item()}, j={j}] Device AFTER value update: value={value_device_after_update}")
-
-        # --- End Update Section ---
-
-        # Return the updated accumulators
-        return value, count
+             # Return the full output object
+             print("--- Returning decoded frames and final latents ---")
+             return output
