@@ -209,6 +209,16 @@ class StableDiffusionDiffuEraserPipeline(
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor, do_convert_rgb=True)
         self.register_to_config(requires_safety_checker=requires_safety_checker)
+        print("--- Enabling gradient checkpointing for UNet and BrushNet ---")
+        # Ensure the underlying models support this method
+        if hasattr(self.unet, "enable_gradient_checkpointing"):
+            self.unet.enable_gradient_checkpointing()
+        else:
+             print("Warning: UNet does not support enable_gradient_checkpointing()")
+        if hasattr(self.brushnet, "enable_gradient_checkpointing"):
+            self.brushnet.enable_gradient_checkpointing()
+        else:
+             print("Warning: BrushNet does not support enable_gradient_checkpointing()")
 
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline._encode_prompt
     def _encode_prompt(
@@ -1575,8 +1585,11 @@ class StableDiffusionDiffuEraserPipeline(
         up_block_add_samples_gpu = [res.to(unet_device) for res in up_block_res_samples_cpu]
 
         # Clean up CPU tensors
+        print(f"[t={t_val}, j={j}] Aggressively clearing cache before UNet...")
         del down_block_res_samples_cpu, mid_block_res_sample_cpu, up_block_res_samples_cpu
-        print(f"[t={t_val}, j={j}] Cleared BrushNet CPU tensors.")
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         # --- End BrushNet Section ---
 
         # --- UNet Inference ---
