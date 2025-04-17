@@ -970,6 +970,156 @@ class StableDiffusionDiffuEraserPipeline(
                 If `return_dict` is `True`, [`~pipelines.diffueraser.pipeline_diffueraser.DiffuEraserPipelineOutput`] is returned,
                 otherwise a `tuple` is returned where the first element is a list with the generated frames.
         """
+        # --- 0. Initial Setup ---
+        # Get BrushNet reference early
+        brushnet = self.brushnet._orig_mod if is_compiled_module(self.brushnet) else self.brushnet
+
+        # Handle callbacks, validate inputs, set internal state, normalize control guidance
+        callback, callback_steps, control_guidance_start, control_guidance_end = \
+            self._setup_pipeline_state_and_validate(
+                prompt, images, masks, negative_prompt, prompt_embeds, negative_prompt_embeds,
+                ip_adapter_image, ip_adapter_image_embeds, brushnet_conditioning_scale,
+                control_guidance_start, control_guidance_end, callback_on_step_end_tensor_inputs,
+                guidance_scale, clip_skip, cross_attention_kwargs, **kwargs
+            )
+
+        # --- 1. Prepare Common Inputs (Prompts, IP Adapter, basic params) ---
+        batch_size, device, video_length, effective_guess_mode, prompt_embeds_unet, added_cond_kwargs = \
+            self._prepare_common_inputs(
+                prompt, prompt_embeds, negative_prompt, negative_prompt_embeds, images,
+                num_images_per_prompt, ip_adapter_image, ip_adapter_image_embeds,
+                brushnet, guess_mode
+            )
+
+        # --- 2. Prepare Image-Based Inputs (VAE Encode, Masks, Conditioning Tensor) ---
+        conditioning_latents, height, width, latent_height, latent_width = \
+            self._prepare_image_based_inputs(
+                images, masks, width, height, batch_size, num_images_per_prompt, device
+            )
+
+        # --- 3. Prepare Latents and Scheduler ---
+        latents, timesteps, num_inference_steps, extra_step_kwargs = \
+            self._prepare_latents_and_scheduler(
+                batch_size, num_images_per_prompt, video_length, height, width,
+                prompt_embeds_unet, device, generator, latents,
+                num_inference_steps, timesteps, eta
+            )
+
+        # --- 4. Initialize Denoising Loop Variables ---
+        (
+            brushnet_keep, context_list, context_list_swap, scheduler_status, scheduler_status_swap,
+            value, count, num_warmup_steps, is_unet_compiled, is_brushnet_compiled, is_torch_higher_equal_2_1,
+            unet_device, cpu_device, timestep_cond
+        ) = self._initialize_denoising_loop_variables(
+            timesteps, control_guidance_start, control_guidance_end, brushnet,
+            video_length, num_frames, latents, device, num_inference_steps
+        )
+        print(f"--- Device Setup: Target Computation Device = {unet_device}, CPU on {cpu_device} ---")
+
+
+        # --- 5. Denoising loop ---
+        with self.progress_bar(total=num_inference_steps) as progress_bar:
+            for i, t in enumerate(timesteps):
+
+                value.zero_()
+                count.zero_()
+                value = value.to(unet_device)
+                count = count.to(unet_device)
+
+                if (i % 2 == 1):
+                    context_list_choose = context_list_swap
+                    scheduler_status_choose = scheduler_status_swap
+                else:
+                    context_list_choose = context_list
+                    scheduler_status_choose = scheduler_status
+
+                # Inner loop processing context windows
+                for j, context in enumerate(context_list_choose):
+                    current_latents_for_context = latents[context, :, :, :]
+
+                    value, count = self._process_context_step(
+                        j=j, context=context, scheduler_state=scheduler_status_choose[j],
+                        current_latents_context=current_latents_for_context,
+                        value=value, count=count, t=t, i=i,
+                        unet_device=unet_device, cpu_device=cpu_device,
+                        original_prompt_embeds=prompt_embeds_unet, # Use UNet embeds
+                        conditioning_latents=conditioning_latents,
+                        timestep_cond=timestep_cond,
+                        brushnet_keep=brushnet_keep,
+                        brushnet_conditioning_scale=brushnet_conditioning_scale,
+                        guess_mode=effective_guess_mode, # Use effective guess mode
+                        is_unet_compiled=is_unet_compiled,
+                        is_brushnet_compiled=is_brushnet_compiled,
+                        is_torch_higher_equal_2_1=is_torch_higher_equal_2_1,
+                        extra_step_kwargs=extra_step_kwargs,
+                        added_cond_kwargs=added_cond_kwargs,
+                    )
+                # End inner context loop
+
+                latents = self._finalize_timestep(
+                    value=value, latents=latents, i=i, t=t, timesteps=timesteps,
+                    num_warmup_steps=num_warmup_steps, progress_bar=progress_bar,
+                    prompt_embeds_unet=prompt_embeds_unet, # Pass embeds for callback
+                    callback_on_step_end=callback_on_step_end,
+                    callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
+                    callback=callback, callback_steps=callback_steps # Pass legacy args
+                )
+        # --- End Denoising Loop ---
+
+        # --- 6. Post-processing and Output ---
+        if hasattr(self, "final_offload_hook") and self.final_offload_hook is not None:
+            print("--- Offloading UNet and BrushNet ---")
+            self.unet.to("cpu")
+            self.brushnet.to("cpu")
+            torch.cuda.empty_cache()
+
+        print("--- Final garbage collection before returning from pipeline __call__ ---")
+        gc.collect()
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
+
+        if output_type == "latent":
+            print("--- Returning latents directly (output_type='latent') ---")
+            output = DiffuEraserPipelineOutput(frames=None, latents=latents)
+        else:
+            print(f"--- Decoding final latents to output_type='{output_type}' ---")
+            decode_dtype = self.vae.dtype
+            if latents.dtype != decode_dtype and not torch.backends.mps.is_available():
+                print(f"--- Casting latents from {latents.dtype} to {decode_dtype} for VAE decoding ---")
+                latents_for_decode = latents.to(decode_dtype)
+            else:
+                latents_for_decode = latents
+
+            video_tensor = self.decode_latents(latents_for_decode, weight_dtype=decode_dtype)
+
+            if output_type == "pt":
+                video = video_tensor
+            else:
+                video = self.image_processor.postprocess(video_tensor, output_type=output_type)
+
+            output = DiffuEraserPipelineOutput(frames=video, latents=latents)
+
+        self.maybe_free_model_hooks()
+
+        if not return_dict:
+            return (output.frames,)
+        else:
+            print("--- Returning decoded frames and final latents ---")
+            return output
+
+
+
+    def _setup_pipeline_state_and_validate(
+        self,
+        prompt, images, masks,
+        negative_prompt, prompt_embeds, negative_prompt_embeds,
+        ip_adapter_image, ip_adapter_image_embeds,
+        brushnet_conditioning_scale,
+        control_guidance_start, control_guidance_end,
+        callback_on_step_end_tensor_inputs,
+        guidance_scale, clip_skip, cross_attention_kwargs,
+        **kwargs,
+    ) -> Tuple[Optional[Callable], Optional[int], List[float], List[float]]:
+        """Handles callbacks, validates inputs, normalizes control guidance, and sets internal state."""
         # Handle callbacks deprecation
         callback = kwargs.pop("callback", None)
         callback_steps = kwargs.pop("callback_steps", None)
@@ -986,10 +1136,6 @@ class StableDiffusionDiffuEraserPipeline(
                 "1.0.0",
                 "Passing `callback_steps` as an input argument to `__call__` is deprecated, consider using `callback_on_step_end`",
             )
-
-        # Get BrushNet module reference
-        brushnet = self.brushnet._orig_mod if is_compiled_module(self.brushnet) else self.brushnet
-
         # Align format for control guidance start/end to be lists
         if not isinstance(control_guidance_start, list) and isinstance(control_guidance_end, list):
             control_guidance_start = len(control_guidance_end) * [control_guidance_start]
@@ -1000,63 +1146,73 @@ class StableDiffusionDiffuEraserPipeline(
                 [control_guidance_start],
                 [control_guidance_end],
             )
-
         # 1. Check inputs. Raise error if not correct
+        # Note: callback_steps is passed here for validation if needed by check_inputs
         self.check_inputs(
             prompt,
             images,
             masks,
-            callback_steps,
+            callback_steps, # Pass the potentially None value
             negative_prompt,
             prompt_embeds,
             negative_prompt_embeds,
             ip_adapter_image,
             ip_adapter_image_embeds,
             brushnet_conditioning_scale,
-            control_guidance_start,
-            control_guidance_end,
+            control_guidance_start, # Pass the normalized list
+            control_guidance_end,   # Pass the normalized list
             callback_on_step_end_tensor_inputs,
         )
-
         # Set internal attributes used by helper methods/properties
         self._guidance_scale = guidance_scale
         self._clip_skip = clip_skip
         self._cross_attention_kwargs = cross_attention_kwargs
 
-        # 2. Define call parameters
+        return callback, callback_steps, control_guidance_start, control_guidance_end
+
+
+    def _prepare_common_inputs(
+        self,
+        prompt, prompt_embeds, negative_prompt, negative_prompt_embeds,
+        images, # Needed for video_length
+        num_images_per_prompt,
+        ip_adapter_image, ip_adapter_image_embeds,
+        brushnet, # Pass BrushNet reference
+        guess_mode,
+    ) -> Tuple[int, torch.device, int, bool, torch.Tensor, Optional[Dict[str, Any]]]:
+        """Determines call parameters, encodes prompts, and prepares IP adapter."""
+        # Determine batch size
         if prompt is not None and isinstance(prompt, str):
             batch_size = 1
         elif prompt is not None and isinstance(prompt, list):
             batch_size = len(prompt)
+        elif prompt_embeds is not None:
+            batch_size = prompt_embeds.shape[0]
         else:
-            # Determine batch size from provided prompt embeddings
-            batch_size = prompt_embeds.shape[0] if prompt_embeds is not None else 1
+            batch_size = 1 # Default if no prompt info
 
-        device = self._execution_device # Get the primary device the pipeline is running on
+        device = self._execution_device # Get the primary device
 
-        # Determine guess mode (defaults to False unless BrushNet uses global pooling)
+        # Determine guess mode
         global_pool_conditions = getattr(brushnet.config, "global_pool_conditions", False)
-        guess_mode = guess_mode or global_pool_conditions
-        # Get video length from the input list of masked images
+        effective_guess_mode = guess_mode or global_pool_conditions
         video_length = len(images)
 
-        # 3. Encode input prompt
+        # Encode input prompt
         text_encoder_lora_scale = (
             self.cross_attention_kwargs.get("scale", None) if self.cross_attention_kwargs is not None else None
         )
-        # Encode positive and negative prompts
         original_prompt_embeds, original_negative_prompt_embeds = self.encode_prompt(
             prompt,
             device,
             num_images_per_prompt,
-            self.do_classifier_free_guidance, # Tells encode_prompt if negative embeds are needed
+            self.do_classifier_free_guidance,
             negative_prompt,
-            prompt_embeds=prompt_embeds, # Pass provided embeds if available
-            negative_prompt_embeds=negative_prompt_embeds, # Pass provided embeds if available
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
             lora_scale=text_encoder_lora_scale,
             clip_skip=self.clip_skip,
         )
-
         # Prepare the specific prompt embeddings required by the UNet based on CFG setting
         if self.do_classifier_free_guidance:
             prompt_embeds_unet = torch.cat([original_negative_prompt_embeds, original_prompt_embeds])
@@ -1064,335 +1220,235 @@ class StableDiffusionDiffuEraserPipeline(
             prompt_embeds_unet = original_prompt_embeds
 
         # Prepare IP Adapter embeddings if needed
-        image_embeds = None # Initialize
+        added_cond_kwargs = None
         if ip_adapter_image is not None or ip_adapter_image_embeds is not None:
             image_embeds = self.prepare_ip_adapter_image_embeds(
                 ip_adapter_image,
                 ip_adapter_image_embeds,
                 device,
-                batch_size * num_images_per_prompt, # Usually batch_size = 1 for video
+                batch_size * num_images_per_prompt,
                 self.do_classifier_free_guidance,
             )
-            # Store IP adapter embeds in added_cond_kwargs for the UNet
             added_cond_kwargs = {"image_embeds": image_embeds}
-        else:
-            added_cond_kwargs = None # Ensure it's defined
 
-        # 4. Prepare image and mask inputs
-        if isinstance(brushnet, BrushNetModel):
-            # Preprocess the list of masked images (input `images`)
-            prepared_images = self.prepare_image(
-                images=images,
-                width=width,
-                height=height,
-                batch_size=batch_size * num_images_per_prompt,
-                num_images_per_prompt=num_images_per_prompt,
-                device=device,
-                dtype=self.vae.dtype, # Prepare images in VAE dtype for encoding
-            )
-            # Preprocess the list of masks (input `masks`)
-            prepared_masks = self.prepare_image(
-                images=masks,
-                width=width,
-                height=height,
-                batch_size=batch_size * num_images_per_prompt,
-                num_images_per_prompt=num_images_per_prompt,
-                device=device,
-                dtype=torch.float32, # Prepare masks as float for processing
-            )
-
-            # Convert prepared masks to binary single channel format
-            # Create INVERTED mask (0=masked, 1=background)
-            inverted_masks_new = []
-            for processed_mask_tensor in prepared_masks:
-                 # Assuming input mask [0, 255] maps to [0, 1] in prepare_image.
-                 # We want 0 where the mask is present (> threshold), and 1 otherwise.
-                 inverted_binary_mask = (processed_mask_tensor.sum(dim=1, keepdim=True) < 1e-5).to(processed_mask_tensor.dtype)
-                 inverted_masks_new.append(inverted_binary_mask)
-            prepared_masks_processed = inverted_masks_new # List of [B, 1, H, W] tensors (0=masked, 1=background)
-
-            # Get final height/width from prepared tensors
-            # Use height/width determined by prepare_image if not provided initially
-            height, width = prepared_images[0].shape[-2:]
-        else:
-            raise ValueError("BrushNet model not found or is not the expected type.")
+        return batch_size, device, video_length, effective_guess_mode, prompt_embeds_unet, added_cond_kwargs
 
 
-        # 5. Prepare timesteps
-        timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, num_inference_steps, device, timesteps)
-        self._num_timesteps = len(timesteps)
+    def _prepare_image_based_inputs(
+        self,
+        images: PipelineImageInput,
+        masks: PipelineImageInput,
+        width: Optional[int],
+        height: Optional[int],
+        batch_size: int,
+        num_images_per_prompt: int,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, int, int, int, int]:
+        """Prepares image/mask inputs, VAE encodes, prepares conditioning tensor."""
+        # Get BrushNet module reference (needed for dtype)
+        brushnet = self.brushnet._orig_mod if is_compiled_module(self.brushnet) else self.brushnet
+        if not isinstance(brushnet, BrushNetModel):
+                raise ValueError("BrushNet model not found or is not the expected type.")
 
-        # 6. Prepare latent variables
-        num_channels_latents = self.unet.config.in_channels
-        latent_height, latent_width = height // self.vae_scale_factor, width // self.vae_scale_factor
-        # Target shape for latents within the loop: (T, C, H_lat, W_lat)
-        latents_shape_for_loop = (video_length, num_channels_latents, latent_height, latent_width)
+        # Preprocess the list of masked images (input `images`)
+        prepared_images = self.prepare_image(
+            images=images,
+            width=width,
+            height=height,
+            batch_size=batch_size * num_images_per_prompt,
+            num_images_per_prompt=num_images_per_prompt,
+            device=device,
+            dtype=self.vae.dtype, # Prepare images in VAE dtype for encoding
+        )
+        # Preprocess the list of masks (input `masks`)
+        prepared_masks = self.prepare_image(
+            images=masks,
+            width=width,
+            height=height,
+            batch_size=batch_size * num_images_per_prompt,
+            num_images_per_prompt=num_images_per_prompt,
+            device=device,
+            dtype=torch.float32, # Prepare masks as float for processing
+        )
+        # Get final height/width from prepared tensors if not provided
+        height, width = prepared_images[0].shape[-2:]
+        latent_height = height // self.vae_scale_factor
+        latent_width = width // self.vae_scale_factor
 
-        if latents is None:
-            print(f"--- Generating initial noise for shape (T,C,H,W): {latents_shape_for_loop} ---")
-            # Ensure noise dtype matches the expected input dtype for the UNet
-            noise_dtype = prompt_embeds_unet.dtype
-            noise = randn_tensor(latents_shape_for_loop, generator=generator, device=device, dtype=noise_dtype)
-            # Scale the initial noise by the scheduler's sigma
-            latents = noise * self.scheduler.init_noise_sigma
-        else:
-            # Use provided latents
-            print(f"--- Using provided latents, shape: {latents.shape} ---")
-            # Ensure provided latents are on the correct device and dtype
-            latents = latents.to(device=device, dtype=prompt_embeds_unet.dtype)
-            if latents.shape != latents_shape_for_loop:
-                 print(f"Warning: Provided latents shape {latents.shape} does not match expected {latents_shape_for_loop}. Reshaping or errors might occur.")
-            # No noise scaling needed if latents are provided (assumed to be already noisy)
+        # Convert prepared masks to binary single channel format (INVERTED: 0=masked)
+        inverted_masks_new = []
+        for processed_mask_tensor in prepared_masks:
+                inverted_binary_mask = (processed_mask_tensor.sum(dim=1, keepdim=True) < 1e-5).to(processed_mask_tensor.dtype)
+                inverted_masks_new.append(inverted_binary_mask)
+        prepared_masks_processed = inverted_masks_new # List of [B, 1, H, W] tensors
 
-
-        # 6.1 Prepare condition latents (VAE encode masked images)
-        # Concatenate the list of prepared images [B, C, H, W] into single tensor [T, C, H, W] (assuming B=1)
-        images_cat = torch.cat(prepared_images, dim=0) # Already in vae.dtype
-
-        # --- VAE Encoding (Optimized) ---
-        conditioning_latents_list = [] # Use list for intermediate CPU storage
+        # VAE Encode prepared images (conditioning latents)
+        images_cat = torch.cat(prepared_images, dim=0)
+        conditioning_latents_list = []
         num_vae_batch_cond = 4 # Adjust based on VRAM
         print(f"--- Preparing conditioning latents using VAE batch size {num_vae_batch_cond} ---")
         vae_original_device_cond = self.vae.device
         cpu_device = torch.device("cpu")
         try:
-            self.vae.to(device) # Move VAE to computation device
-            print(f"--- Moved VAE to {device} for conditioning latent encoding ---")
+            self.vae.to(device)
             with torch.no_grad():
-                 for i_vae in range(0, images_cat.shape[0], num_vae_batch_cond):
-                     batch_images_cond = images_cat[i_vae : i_vae + num_vae_batch_cond] # Already correct dtype
-                     encoded_latent_dist = self.vae.encode(batch_images_cond).latent_dist
-                     # Sample latents and move to CPU immediately
-                     conditioning_latents_list.append(encoded_latent_dist.sample().to(cpu_device))
-
-            # Concatenate all intermediate latents on the CPU
-            conditioning_latents = torch.cat(conditioning_latents_list, dim=0)
-            print(f"--- Concatenated conditioning latents on CPU, shape: {conditioning_latents.shape} ---")
-            # Move the final, full tensor to the GPU
-            conditioning_latents = conditioning_latents.to(device)
-            print(f"--- Moved final conditioning latents to {device} ---")
-
+                    for i_vae in range(0, images_cat.shape[0], num_vae_batch_cond):
+                        batch_images_cond = images_cat[i_vae : i_vae + num_vae_batch_cond]
+                        encoded_latent_dist = self.vae.encode(batch_images_cond).latent_dist
+                        conditioning_latents_list.append(encoded_latent_dist.sample().to(cpu_device))
+            conditioning_latents = torch.cat(conditioning_latents_list, dim=0).to(device)
         finally:
-            # Return VAE to its original device (important if offloading is used)
             self.vae.to(vae_original_device_cond)
-            print(f"--- Returned VAE to {vae_original_device_cond} ---")
-            del conditioning_latents_list # Clear intermediate list from memory
-            # Explicitly clear cache after potential large tensor operations and moves
+            del conditioning_latents_list
             if torch.cuda.is_available(): torch.cuda.empty_cache()
             gc.collect()
-        # --- End VAE Encoding ---
 
-        # Apply VAE scaling factor
         conditioning_latents = conditioning_latents * self.vae.config.scaling_factor
 
-        # Clean up VAE input images tensor
         print(f"--- Deleting intermediate 'images_cat' tensor (shape: {images_cat.shape}) ---")
-        del images_cat, prepared_images # Delete concatenated tensor and the list
+        del images_cat, prepared_images
         if torch.cuda.is_available(): torch.cuda.empty_cache()
         gc.collect()
 
-        # Prepare masks for concatenation with conditioning latents
-        # Concatenate the list of prepared *inverted* masks [B, 1, H, W] -> [T, 1, H, W]
+        # Interpolate masks and concatenate with conditioning latents
         inverted_masks_cat = torch.cat(prepared_masks_processed, dim=0)
-        # Interpolate masks to latent dimensions (H_lat, W_lat)
         masks_interp = torch.nn.functional.interpolate(
-            inverted_masks_cat,
-            size=(latent_height, latent_width)
-        ) ## [T, 1, H_lat, W_lat] (0=masked, 1=background)
-
-        # Clean up original size masks tensor
+            inverted_masks_cat, size=(latent_height, latent_width)
+        )
         print(f"--- Deleting intermediate 'inverted_masks_cat' tensor (shape: {inverted_masks_cat.shape}) ---")
-        del inverted_masks_cat, prepared_masks_processed # Delete concatenated tensor and the list
+        del inverted_masks_cat, prepared_masks_processed
         if torch.cuda.is_available(): torch.cuda.empty_cache()
         gc.collect()
 
-        # Concatenate VAE latents and interpolated *inverted* masks -> [T, C+1, H_lat, W_lat]
-        # Ensure interpolated masks are on the same device and dtype as conditioning_latents
         conditioning_latents = torch.cat([
             conditioning_latents,
             masks_interp.to(conditioning_latents.device, dtype=conditioning_latents.dtype)
         ], dim=1)
-        print(f"--- Final conditioning_latents shape (incl. INVERTED mask): {conditioning_latents.shape} on {conditioning_latents.device} ---")
-
-        # Clean up interpolated masks tensor
-        print(f"--- Deleting intermediate 'masks_interp' tensor (shape: {masks_interp.shape}) ---")
+        print(f"--- Final conditioning_latents shape (incl. INVERTED mask): {conditioning_latents.shape} ---")
         del masks_interp
         if torch.cuda.is_available(): torch.cuda.empty_cache()
         gc.collect()
 
+        return conditioning_latents, height, width, latent_height, latent_width
 
-        # 6.5 Optionally get Guidance Scale Embedding for LCM/SCM schedulers
-        timestep_cond = None
-        if self.unet.config.time_cond_proj_dim is not None:
-            guidance_scale_tensor = torch.tensor(self.guidance_scale - 1).repeat(batch_size * num_images_per_prompt)
-            # Ensure embedding dtype matches latent dtype
-            timestep_cond = self.get_guidance_scale_embedding(
-                guidance_scale_tensor, embedding_dim=self.unet.config.time_cond_proj_dim
-            ).to(device=device, dtype=latents.dtype)
 
+    def _prepare_latents_and_scheduler(
+        self,
+        batch_size: int,
+        num_images_per_prompt: int,
+        num_frames_for_noise: int, # Use video_length here
+        height: int,
+        width: int,
+        prompt_embeds_unet: torch.Tensor, # For dtype
+        device: torch.device,
+        generator: Optional[Union[torch.Generator, List[torch.Generator]]],
+        latents: Optional[torch.FloatTensor], # User-provided latents
+        num_inference_steps: int,
+        timesteps: Optional[List[int]], # User-provided timesteps
+        eta: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor, int, Dict[str, Any]]:
+        """Prepares initial latents, timesteps, and scheduler kwargs."""
+        # 5. Prepare timesteps
+        timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, num_inference_steps, device, timesteps)
+        self._num_timesteps = len(timesteps) # Set internal state
+
+        # 6. Prepare latent variables
+        num_channels_latents = self.unet.config.in_channels
+        latents_shape = (
+            num_frames_for_noise, # Use video_length
+            num_channels_latents,
+            height // self.vae_scale_factor,
+            width // self.vae_scale_factor
+        )
+
+        if latents is None:
+            print(f"--- Generating initial noise for shape (T,C,H,W): {latents_shape} ---")
+            noise_dtype = prompt_embeds_unet.dtype
+            # NOTE: Assuming batch_size * num_images_per_prompt = 1 for video generation noise
+            effective_batch_size_for_noise = 1
+            # Adapt prepare_latents call if needed, or generate directly
+            noise = randn_tensor(latents_shape, generator=generator, device=device, dtype=noise_dtype)
+            # Scale the initial noise by the scheduler's sigma
+            latents = noise * self.scheduler.init_noise_sigma
+            del noise
+        else:
+            print(f"--- Using provided latents, shape: {latents.shape} ---")
+            latents = latents.to(device=device, dtype=prompt_embeds_unet.dtype)
+            if latents.shape[1:] != latents_shape[1:]: # Check channel/spatial dims match
+                    raise ValueError(f"Provided latents shape {latents.shape} C/H/W dimensions do not match expected {latents_shape}")
+            if latents.shape[0] != num_frames_for_noise: # Check temporal dim
+                    print(f"Warning: Provided latents temporal dim {latents.shape[0]} != video length {num_frames_for_noise}.")
+                    # Decide handling: truncate, error, etc. Let's assume it should match.
+                    if latents.shape[0] < num_frames_for_noise:
+                        raise ValueError("Provided latents are shorter than video length.")
+                    latents = latents[:num_frames_for_noise] # Truncate if longer
+            # Provided latents are assumed already noisy, no scaling needed.
 
         # 7. Prepare extra step kwargs for scheduler
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
-        # 7.1 Added condition kwargs (already prepared with IP adapter check)
+        return latents, timesteps, num_inference_steps, extra_step_kwargs
 
-        # 7.2 Create tensor stating which brushnets to keep active during inference steps
+
+    def _initialize_denoising_loop_variables(
+        self,
+        timesteps: torch.Tensor,
+        control_guidance_start: List[float],
+        control_guidance_end: List[float],
+        brushnet, # Pass BrushNet reference
+        video_length: int,
+        num_frames: int, # Context window size
+        latents: torch.Tensor,
+        device: torch.device,
+        num_inference_steps: int,
+    ) -> Tuple[
+        List[float], List, List, List[Dict], List[Dict], torch.Tensor, torch.Tensor,
+        int, bool, bool, bool, torch.device, torch.device, Optional[torch.Tensor]
+    ]:
+        """Initializes variables needed for the main denoising loop."""
+        # Calculate brushnet_keep schedule
         brushnet_keep = []
         for i_keep in range(len(timesteps)):
             keeps = [
                 1.0 - float(i_keep / len(timesteps) < s or (i_keep + 1) / len(timesteps) > e)
                 for s, e in zip(control_guidance_start, control_guidance_end)
             ]
-            # Assuming only one BrushNet, take the first element
             brushnet_keep.append(keeps[0] if isinstance(brushnet, BrushNetModel) else keeps)
 
-
-        # Prepare context lists and scheduler states for sliding window approach
-        overlap = num_frames // 4 # Calculate overlap based on context window size
+        # Prepare context lists and scheduler states
+        overlap = num_frames // 4
         context_list, context_list_swap = get_frames_context_swap(video_length, overlap=overlap, num_frames_per_clip=num_frames)
-        # Store initial scheduler state to restore for each context window
         scheduler_status = [copy.deepcopy(self.scheduler.__dict__)] * len(context_list)
         scheduler_status_swap = [copy.deepcopy(self.scheduler.__dict__)] * len(context_list_swap)
 
-        # Initialize accumulators for blending results across context windows
-        value = torch.zeros_like(latents) # Accumulates processed latents, shape (T, C, H_lat, W_lat)
-        # Use single channel for count to save memory, shape (T, 1, H_lat, W_lat)
-        count = torch.zeros_like(latents[:, 0:1, :, :])
+        # Initialize accumulators
+        value = torch.zeros_like(latents)
+        count = torch.zeros_like(latents[:, 0:1, :, :]) # Single channel count
 
-
-        # 8. Denoising loop
+        # Denoising loop setup parameters
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
-        # Check if models are compiled
         is_unet_compiled = is_compiled_module(self.unet)
         is_brushnet_compiled = is_compiled_module(self.brushnet)
         is_torch_higher_equal_2_1 = is_torch_version(">=", "2.1")
 
         # Determine target devices
-        unet_device = device # Use the main pipeline device for computation
-        cpu_device = torch.device("cpu") # Use CPU for temporary offloading
-        print(f"--- Device Setup: Target Computation Device = {unet_device}, CPU on {cpu_device} ---")
+        unet_device = device # Use the main pipeline device
+        cpu_device = torch.device("cpu")
 
+        # Optionally get Guidance Scale Embedding
+        timestep_cond = None
+        if self.unet.config.time_cond_proj_dim is not None:
+            # Assuming batch_size = 1 for video
+            guidance_scale_tensor = torch.tensor(self.guidance_scale - 1).repeat(1)
+            timestep_cond = self.get_guidance_scale_embedding(
+                guidance_scale_tensor, embedding_dim=self.unet.config.time_cond_proj_dim
+            ).to(device=device, dtype=latents.dtype)
 
-        # Start denoising loop
-        with self.progress_bar(total=num_inference_steps) as progress_bar:
-            for i, t in enumerate(timesteps):
-
-                # Zero accumulators and ensure they are on the computation device at the start of each timestep
-                value.zero_()
-                count.zero_()
-                value = value.to(unet_device)
-                count = count.to(unet_device)
-
-                # Choose context list based on swapping logic (alternating context starts)
-                if (i % 2 == 1):
-                    context_list_choose = context_list_swap
-                    scheduler_status_choose = scheduler_status_swap
-                else:
-                    context_list_choose = context_list
-                    scheduler_status_choose = scheduler_status
-
-                # --- Inner loop processing context windows ---
-                for j, context in enumerate(context_list_choose):
-                    # Get the slice of latents for the current context window
-                    # Use the 'latents' from the *start* of timestep i
-                    current_latents_for_context = latents[context, :, :, :]
-
-                    # Call the helper method to process this context window
-                    # This method modifies 'value' and 'count' in-place via blending/assignment
-                    value, count = self._process_context_step(
-                        j=j,
-                        context=context,
-                        scheduler_state=scheduler_status_choose[j],
-                        current_latents_context=current_latents_for_context, # Pass the slice
-                        value=value,     # Pass current accumulated value tensor
-                        count=count,     # Pass current accumulated count tensor
-                        t=t,             # Current timestep
-                        i=i,             # Outer loop index
-                        unet_device=unet_device,
-                        cpu_device=cpu_device,
-                        original_prompt_embeds=prompt_embeds_unet, # Pass the correctly prepared UNet embeds
-                        conditioning_latents=conditioning_latents, # Pass the VAE encoded + *inverted* mask tensor
-                        timestep_cond=timestep_cond,
-                        brushnet_keep=brushnet_keep,
-                        brushnet_conditioning_scale=brushnet_conditioning_scale,
-                        guess_mode=guess_mode,
-                        is_unet_compiled=is_unet_compiled,
-                        is_brushnet_compiled=is_brushnet_compiled,
-                        is_torch_higher_equal_2_1=is_torch_higher_equal_2_1,
-                        extra_step_kwargs=extra_step_kwargs,
-                        added_cond_kwargs=added_cond_kwargs,
-                    )
-                # --- End inner context loop ---
-
-                # Replace the original block with this call:
-                latents = self._finalize_timestep(
-                    value=value,
-                    latents=latents, # Pass current latents
-                    i=i,
-                    t=t,
-                    timesteps=timesteps,
-                    num_warmup_steps=num_warmup_steps,
-                    progress_bar=progress_bar,
-                    prompt_embeds_unet=prompt_embeds_unet, # Pass embeds for callback use
-                    callback_on_step_end=callback_on_step_end,
-                    callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
-                    callback=callback, # Pass legacy callback function
-                    callback_steps=callback_steps # Pass legacy callback steps
-                )
-        # --- End Denoising Loop ---
-
-        # Offload models if sequential offloading is enabled
-        if hasattr(self, "final_offload_hook") and self.final_offload_hook is not None:
-             print("--- Offloading UNet and BrushNet ---")
-             self.unet.to("cpu")
-             self.brushnet.to("cpu")
-             torch.cuda.empty_cache()
-
-        # Final garbage collection
-        print("--- Final garbage collection before returning from pipeline __call__ ---")
-        gc.collect()
-        if torch.cuda.is_available(): torch.cuda.empty_cache()
-
-        # --- Prepare Output ---
-        if output_type == "latent":
-             # Return latents directly without decoding
-             print("--- Returning latents directly (output_type='latent') ---")
-             output = DiffuEraserPipelineOutput(frames=None, latents=latents)
-        else:
-             # Decode latents to video frames
-             print(f"--- Decoding final latents to output_type='{output_type}' ---")
-             # Ensure decoder uses a compatible dtype (usually VAE's dtype)
-             decode_dtype = self.vae.dtype
-             # Handle cases where latents might be float32 but VAE prefers float16/bfloat16
-             if latents.dtype != decode_dtype and not torch.backends.mps.is_available(): # Avoid cast on MPS if types differ significantly
-                print(f"--- Casting latents from {latents.dtype} to {decode_dtype} for VAE decoding ---")
-                latents_for_decode = latents.to(decode_dtype)
-             else:
-                latents_for_decode = latents
-
-             video_tensor = self.decode_latents(latents_for_decode, weight_dtype=decode_dtype)
-
-             # Postprocess video tensor to requested format (PIL, np, etc.)
-             if output_type == "pt":
-                 video = video_tensor
-             else:
-                 video = self.image_processor.postprocess(video_tensor, output_type=output_type)
-
-             # Create output object, including final latents even if frames are returned
-             output = DiffuEraserPipelineOutput(frames=video, latents=latents)
-
-
-        # Potentially free model hooks (related to offloading)
-        self.maybe_free_model_hooks()
-
-        # Return based on return_dict setting
-        if not return_dict:
-             # Return only the frames/video (or None if output_type was latent)
-             return (output.frames,)
-        else:
-             # Return the full output object
-             print("--- Returning decoded frames and final latents ---")
-             return output
+        return (
+            brushnet_keep, context_list, context_list_swap, scheduler_status, scheduler_status_swap,
+            value, count, num_warmup_steps, is_unet_compiled, is_brushnet_compiled, is_torch_higher_equal_2_1,
+            unet_device, cpu_device, timestep_cond
+        )
 
 
     # Define the helper method within the class
@@ -1493,7 +1549,6 @@ class StableDiffusionDiffuEraserPipeline(
             guess_mode=guess_mode,
             return_dict=False,
         )
-
         # Move results to CPU
         print(f"[t={t_val}, j={j}] Moving BrushNet results to CPU...")
         down_block_res_samples_cpu = [res.to(cpu_device) for res in down_block_res_samples]
@@ -1523,7 +1578,6 @@ class StableDiffusionDiffuEraserPipeline(
         del down_block_res_samples_cpu, mid_block_res_sample_cpu, up_block_res_samples_cpu
         print(f"[t={t_val}, j={j}] Cleared BrushNet CPU tensors.")
         # --- End BrushNet Section ---
-
 
         # --- UNet Inference ---
         self.unet.to(unet_device)
