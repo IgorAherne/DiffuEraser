@@ -215,7 +215,7 @@ class DiffuEraser:
         if(self.device != torch.device("cpu")):
             self.brushnet.to(self.device, torch.float16)
             self.unet_main.to(self.device, torch.float16)
-            self.pipeline.to(self.device, torch.float16)
+            self.pipeline.to(self.device, torch.float16) 
             try:
                 self.pipeline.enable_model_cpu_offload()
                 print("--- Enabled Model CPU Offload ---")
