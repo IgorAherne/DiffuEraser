@@ -184,12 +184,6 @@ class DiffuEraser:
 
         ## load model
         self.vae = AutoencoderKL.from_pretrained(vae_path)
-        self.noise_scheduler = DDPMScheduler.from_pretrained(base_model_path, 
-                subfolder="scheduler",
-                prediction_type="v_prediction",
-                timestep_spacing="trailing",
-                rescale_betas_zero_snr=True
-            )
         self.tokenizer = AutoTokenizer.from_pretrained(
                     base_model_path,
                     subfolder="tokenizer",
