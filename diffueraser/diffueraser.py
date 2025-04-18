@@ -226,12 +226,12 @@ class DiffuEraser:
         except Exception as e:
             print(f"--- Failed to enable xFormers: {e}. Using default attention. ---")
 
-        #  Explicit Gradient Checkpointing (Optional but recommended)
-        print("--- Explicitly enabling gradient checkpointing for UNet and BrushNet ---")
-        if hasattr(self.pipeline.unet, "enable_gradient_checkpointing"):
-            self.pipeline.unet.enable_gradient_checkpointing()
-        if hasattr(self.pipeline.brushnet, "enable_gradient_checkpointing"):
-            self.pipeline.brushnet.enable_gradient_checkpointing()
+        #  Explicit Gradient Checkpointing
+        # print("--- Explicitly enabling gradient checkpointing for UNet and BrushNet ---")
+        # if hasattr(self.pipeline.unet, "enable_gradient_checkpointing"):
+        #     self.pipeline.unet.enable_gradient_checkpointing()
+        # if hasattr(self.pipeline.brushnet, "enable_gradient_checkpointing"):
+        #     self.pipeline.brushnet.enable_gradient_checkpointing()
 
         self.pipeline.scheduler = UniPCMultistepScheduler.from_config(self.pipeline.scheduler.config)
         self.pipeline.set_progress_bar_config(disable=True)
@@ -329,7 +329,7 @@ class DiffuEraser:
 
         ################  Prepare Priori Latents (Streamed VAE Encoding) ################
         latents_list = []
-        num_vae_batch = 4 # Adjust based on VRAM
+        num_vae_batch = 8 # Adjust based on VRAM
         vae_module = self.pipeline.vae
 
         print(f"--- Starting VAE encoding for {len(prioris)} priori frames in batches of {num_vae_batch} ---")
@@ -605,7 +605,7 @@ class DiffuEraser:
                 with torch.no_grad():
                     # Pass the actual number of frames being processed
                     pipeline_output = self.pipeline(
-                        num_frames=num_samples, # <<< Pass correct number of frames
+                        num_frames=num_samples,
                         prompt=validation_prompt,
                         images=validation_images_input_pre,
                         masks=validation_masks_input_pre,
