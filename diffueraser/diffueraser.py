@@ -293,11 +293,9 @@ class DiffuEraser:
         ## recheck frame counts and trim lists to the minimum common length
         n_total_frames = min(len(frames), len(validation_masks_input), len(prioris))
         if(n_total_frames < nframes): # Check against the actual nframes used
-            # Raise error or adjust nframes? Let's raise for clarity.
             raise ValueError(f"The effective video duration ({n_total_frames} frames) is shorter than nframes ({nframes}). Processing requires at least nframes.")
         if n_total_frames < 22 and nframes >= 22: # Retain original check related to minimum practical length?
              print(f"Warning: Effective video duration ({n_total_frames} frames) is less than 22, but proceeding with nframes={nframes}.")
-             # Maybe adjust nframes downwards here if needed? e.g. nframes = n_total_frames
 
         validation_masks_input = validation_masks_input[:n_total_frames]
         validation_images_input = validation_images_input[:n_total_frames]
@@ -307,8 +305,6 @@ class DiffuEraser:
         print(f"--- Adjusted lists to effective length: {real_video_length} frames ---")
 
         # Resize frames (ensure consistent size before processing)
-        # Note: resize_frames in diffueraser.py seems basic, just resizes if needed.
-        # Consider if the original full-res frames are needed later or if resized is sufficient.
         prioris = resize_frames(prioris, img_size)
         validation_masks_input = resize_frames(validation_masks_input, img_size)
         validation_images_input = resize_frames(validation_images_input, img_size)
@@ -333,71 +329,49 @@ class DiffuEraser:
 
         ################  Prepare Priori Latents (Streamed VAE Encoding) ################
         latents_list = []
-        # Adjust batch size based on VRAM availability during VAE. 4 is conservative.
-        num_vae_batch = 4
-        vae_module = self.pipeline.vae # Get VAE module reference
+        num_vae_batch = 4 # Adjust based on VRAM
+        vae_module = self.pipeline.vae
 
         print(f"--- Starting VAE encoding for {len(prioris)} priori frames in batches of {num_vae_batch} ---")
-        vae_original_device = vae_module.device # Remember original device (might be CPU if offloaded)
+        vae_original_device = vae_module.device
 
         try:
-            # Ensure VAE is on GPU for encoding
             vae_module.to(self.device)
             print(f"--- Moved VAE to {self.device} for encoding ---")
+            wanted_dtype = torch.float32 if self.device==torch.device("cpu") else torch.float16
 
             with torch.no_grad():
                 for i in range(0, len(prioris), num_vae_batch):
                     batch_pil = prioris[i : i + num_vae_batch]
-                    current_batch_size = len(batch_pil) # Store the actual size of this batch
-
-                    # Preprocess only the current batch
+                    current_batch_size = len(batch_pil)
                     batch_tensor = [self.image_processor.preprocess(img, height=tar_height, width=tar_width).to(dtype=torch.float32) for img in batch_pil]
+                    batch_tensor = torch.cat(batch_tensor).to(device=self.device, dtype=wanted_dtype)
 
-                    wanted_dtype = torch.float32 if self.device==torch.device("cpu") else torch.float16 # Process in float16 if GPU
-                    batch_tensor = torch.cat(batch_tensor).to(device=self.device, dtype=wanted_dtype) 
-
-                    # Encode the batch
                     batch_latents = vae_module.encode(batch_tensor).latent_dist.sample()
-                    # Move to CPU immediately after use to minimize VRAM holding time
                     latents_list.append(batch_latents.cpu())
 
-                    # Optional: Print progress less frequently
-                    if i % (num_vae_batch * 10) == 0: # Check index i, not rely on batch_pil existence later
-                         # Calculate end frame index correctly
+                    if i % (num_vae_batch * 10) == 0:
                          end_frame_index = i + current_batch_size
-                         print(f"--- VAE encoded batch up to frame {end_frame_index} ---") # Use calculated index
+                         print(f"--- VAE encoded batch up to frame {end_frame_index} ---")
 
-                    # Clean up batch tensors AFTER they are no longer needed (including for the print)
                     del batch_pil, batch_tensor, batch_latents
 
-
-            # Concatenate latents on CPU
             latents = torch.cat(latents_list, dim=0)
             print(f"--- VAE Encoding complete, created latents tensor shape: {latents.shape} on CPU ---")
-            del latents_list # Free CPU memory
+            del latents_list
             gc.collect()
 
-            # Move the final, full latents tensor to GPU for the pipeline
             latents = latents.to(self.device)
-            latents = latents * vae_module.config.scaling_factor # Apply scaling factor using the vae object
+            latents = latents * vae_module.config.scaling_factor
             print(f"--- Moved full latents tensor to {self.device} ---")
 
         finally:
-            # Ensure VAE is returned to its original device (likely CPU due to offload)
-            # or explicitly offload if it wasn't automatically handled.
             vae_module.to(vae_original_device)
             print(f"--- Returned VAE to {vae_original_device} ---")
-            # Explicitly clear cache after potential large tensor operations and moves
             torch.cuda.empty_cache()
             gc.collect()
-        ################ Prepare Noise ################
-        shape = (
-            nframes, # Base shape uses nframes
-            self.pipeline.unet.config.in_channels, # Get channels from unet config
-            tar_height // self.vae_scale_factor,
-            tar_width // self.vae_scale_factor
-        )
-        # Determine dtype
+
+        ################ Determine Noise Dtype ################
         if hasattr(self.pipeline, 'text_encoder') and self.pipeline.text_encoder is not None:
             prompt_embeds_dtype = self.pipeline.text_encoder.dtype
         elif hasattr(self.pipeline, 'unet') and self.pipeline.unet is not None:
@@ -405,68 +379,226 @@ class DiffuEraser:
         else:
             prompt_embeds_dtype = torch.float32 if self.device==torch.device("cpu") else torch.float16 # Default fallback
 
+        ################ Prepare Noise and Run Pre-inference ################
+        # Call the new helper method
+        noise, timesteps_add_noise = self._prepare_noise_and_run_pre_inference(
+            nframes=nframes,
+            real_video_length=real_video_length,
+            tar_height=tar_height,
+            tar_width=tar_width,
+            prompt_embeds_dtype=prompt_embeds_dtype,
+            generator=generator,
+            latents=latents,  # Pass the latents tensor (modified in-place)
+            validation_masks_input=validation_masks_input,
+            validation_images_input=validation_images_input,
+            validation_prompt=validation_prompt,
+            guidance_scale_final=guidance_scale_final
+        )
+        # 'latents' tensor is now potentially updated by the pre-inference step within the helper method
+
+        ################  Main Frame-by-frame inference  ################
+        print(f"--- Starting main inference loop using nframes={nframes} ---")
+        ## Add noise to the potentially updated latents tensor
+        # Use the 'noise' and 'timesteps_add_noise' returned by the helper method
+        noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps_add_noise)
+        latents_for_main_inference = noisy_latents # Start main inference from this noisy state
+
+        # Clean up original noise tensor (returned by helper) and the original latents
+        del noise, latents, noisy_latents
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        print(f"--- Calling main pipeline for {real_video_length} frames ---")
+        with torch.no_grad():
+            pipeline_output = self.pipeline(
+                num_frames=nframes, # Pass the chunk size parameter
+                prompt=validation_prompt,
+                images=validation_images_input, # Use original full list
+                masks=validation_masks_input,   # Use original full list
+                num_inference_steps=self.num_inference_steps,
+                generator=generator,
+                guidance_scale=guidance_scale_final,
+                latents=latents_for_main_inference, # Start from noisy latents
+                output_type="pil" # Get PIL images directly
+            )
+            # Check output format
+            if isinstance(pipeline_output, dict) and 'frames' in pipeline_output:
+                images = pipeline_output.frames
+            elif isinstance(pipeline_output, DiffuEraserPipelineOutput):
+                images = pipeline_output.frames
+            elif isinstance(pipeline_output, tuple) and len(pipeline_output)>0: # Older format?
+                images = pipeline_output[0]
+                print("Warning: Main pipeline output format unexpected (tuple), assuming frames.")
+            else: # Assume direct frame output if not dict/tuple/known object
+                 images = pipeline_output
+                 print("Warning: Main pipeline output format unexpected, assuming frames.")
+
+        # Ensure the number of output frames matches expected length
+        if not isinstance(images, list) or len(images) < real_video_length:
+             # Handle cases where output is not a list or length is wrong
+             print(f"Error/Warning: Pipeline returned unexpected output type ({type(images)}) or incorrect frame count ({len(images) if isinstance(images, list) else 'N/A'}). Expected {real_video_length}. Attempting to recover if possible.")
+             # Add recovery logic here if needed, e.g., raise error, pad frames, etc.
+             # For now, we'll just proceed and trim/error later if needed.
+             if not isinstance(images, list): images = [] # Prevent errors later if not a list
+        images = images[:real_video_length] # Trim if pipeline returned more
+        print(f"--- Main inference pipeline call complete, processed {len(images)} frames ---")
+
+        # Clean up large latent tensor used for main inference
+        del latents_for_main_inference
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        ################ Compose Final Video ################
+        print(f"--- Composing final video using original masks and frames ---")
+        binary_masks = validation_masks_input_ori # Use the original masks read from file
+        mask_blurreds = []
+        if blended:
+            print(f"--- Applying blur blending to masks ---")
+            for i in range(len(binary_masks)):
+                mask_np = np.array(binary_masks[i])
+                if mask_np.ndim == 3: mask_np = cv2.cvtColor(mask_np, cv2.COLOR_RGB2GRAY)
+                mask_blurred_np = cv2.GaussianBlur(mask_np, (21, 21), 0) / 255.0
+                binary_mask_np = 1.0 - (1.0 - mask_np / 255.0) * (1.0 - mask_blurred_np)
+                mask_blurreds.append(Image.fromarray((binary_mask_np * 255).astype(np.uint8)))
+            binary_masks = mask_blurreds # Use the blurred versions for composition
+
+        comp_frames = []
+        frames_for_composition = resized_frames_ori # Use the original resized frames
+        print(f"--- Composing {len(images)} generated frames with original frames ---")
+        for i in range(len(images)):
+            if i >= len(frames_for_composition) or i >= len(binary_masks):
+                 print(f"Warning: Skipping composition for frame {i} due to list length mismatch.")
+                 continue # Skip if lists are somehow shorter than generated images
+
+            mask_np = np.expand_dims(np.array(binary_masks[i]), axis=2) / 255.0
+            img_generated_np = np.array(images[i]).astype(np.uint8)
+            img_original_np = np.array(frames_for_composition[i]).astype(np.uint8)
+
+            img_comp_np = (img_generated_np * mask_np + img_original_np * (1.0 - mask_np)).astype(np.uint8)
+            comp_frames.append(Image.fromarray(img_comp_np))
+
+        del images, frames_for_composition, binary_masks, mask_blurreds # Free memory
+        if 'validation_images_input' in locals(): del validation_images_input
+        if 'validation_masks_input' in locals(): del validation_masks_input
+        gc.collect()
+
+        ################ Write Video ################
+        print(f"--- Writing final video to: {output_path} ---")
+        if not comp_frames:
+             print("Error: No frames to write to video!")
+             # Clean up potentially opened resources if needed before returning
+             return None # Or raise error
+
+        default_fps = fps
+        output_size = comp_frames[0].size
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v") # Common codec
+        writer = cv2.VideoWriter(output_path, fourcc, default_fps, output_size)
+
+        if not writer.isOpened():
+             print(f"Error: Could not open video writer for {output_path}")
+             return None
+
+        try:
+            for f_idx, frame_pil in enumerate(comp_frames):
+                img_np_bgr = cv2.cvtColor(np.array(frame_pil), cv2.COLOR_RGB2BGR)
+                writer.write(img_np_bgr)
+        finally:
+             writer.release() # Ensure writer is released even if errors occur during write
+
+        print(f"--- Video writing complete ---")
+
+        return output_path
+            
+
+    def _prepare_noise_and_run_pre_inference(
+        self, nframes, real_video_length, tar_height, tar_width, prompt_embeds_dtype,
+        generator, latents, validation_masks_input, validation_images_input,
+        validation_prompt, guidance_scale_final
+    ):
+        """
+        Generates noise, performs optional pre-inference updating latents in-place.
+
+        Args:
+            nframes (int): The number of frames per processing chunk.
+            real_video_length (int): The total number of frames in the video.
+            tar_height (int): Target height for latents.
+            tar_width (int): Target width for latents.
+            prompt_embeds_dtype (torch.dtype): Data type for noise generation.
+            generator (torch.Generator or None): Random number generator.
+            latents (torch.Tensor): The initial latent tensor (will be modified in-place).
+            validation_masks_input (list[PIL.Image]): List of mask images for pre-inference.
+            validation_images_input (list[PIL.Image]): List of masked images for pre-inference.
+            validation_prompt (str): Text prompt for the pipeline.
+            guidance_scale_final (float): Guidance scale for the pipeline.
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor]:
+                - noise: The full noise tensor tiled/trimmed for the video length.
+                - timesteps_add_noise: Timesteps used for adding noise ([0]).
+        """
+        ################ Prepare Noise Shape and Base Noise ################
+        shape = (
+            nframes, # Base shape uses nframes
+            self.pipeline.unet.config.in_channels, # Get channels from unet config
+            tar_height // self.vae_scale_factor,
+            tar_width // self.vae_scale_factor
+        )
         print(f"--- Preparing base noise for shape {shape} with dtype {prompt_embeds_dtype} ---")
         noise_pre = randn_tensor(shape, device=self.device, dtype=prompt_embeds_dtype, generator=generator)
 
-        # Repeat noise pattern if video is longer than nframes pattern
+        ################ Repeat Noise for Full Video Length ################
         # Calculate necessary repeats based on real_video_length and nframes
         n_repeats_needed = (real_video_length + nframes - 1) // nframes
         print(f"--- Repeating noise pattern {n_repeats_needed} times for {real_video_length} frames ---")
         # Use einops repeat correctly: repeat the *temporal* dimension 't'
-        # The pattern is (t c h w), we want to repeat t -> (repeat t)
         noise = repeat(noise_pre, "t c h w -> (repeat t) c h w", repeat=n_repeats_needed)
         # Trim excess noise to match the exact video length
         noise = noise[:real_video_length, ...]
         print(f"--- Final noise tensor shape: {noise.shape} ---")
 
         ################ Timesteps for Noise Addition ################
-        # This seems to be adding noise only at timestep 0 for the 'add_noise' step later.
-        # This is likely related to how the specific scheduler (UniPC, TCD, LCM) expects initial latents.
-        # Keep as is unless scheduler documentation suggests otherwise.
+        # Fixed timestep [0] seems intended for how schedulers like UniPC/TCD/LCM are used here.
         timesteps_add_noise = torch.tensor([0], device=self.device)
         timesteps_add_noise = timesteps_add_noise.long()
 
-        ################ Pre-inference (Corrected Logic) ################
-        latents_pre_out=None # Initialize
-        sample_index=None    # Initialize
+        ################ Pre-inference (Optional) ################
+        latents_pre_out = None # Initialize
+        sample_index = None    # Initialize
 
         # Condition uses the actual nframes value
         if real_video_length > nframes * 2:
             print(f"--- Running Pre-inference using nframes={nframes} on sampled frames ---")
             ## Sample indices based on nframes
             step = real_video_length / nframes # Use real_video_length for sampling step
-            # Ensure we don't sample more indices than available frames or the desired nframes
-            num_samples = min(nframes, real_video_length)
+            num_samples = min(nframes, real_video_length) # Ensure we don't sample more indices than available frames or the desired nframes
             sample_index = [int(i * step) for i in range(num_samples)]
-            # Ensure indices are within bounds
-            sample_index = [idx for idx in sample_index if idx < real_video_length]
+            sample_index = [idx for idx in sample_index if idx < real_video_length] # Ensure indices are within bounds
             num_samples = len(sample_index) # Update num_samples after bounds check
 
-            print(f"--- Sampled {num_samples} indices for pre-inference: {sample_index[:10]}... ---") # Print first 10
-
-            # Gather inputs for the sampled frames
-            validation_masks_input_pre = [validation_masks_input[i] for i in sample_index]
-            validation_images_input_pre = [validation_images_input[i] for i in sample_index]
-
-            # Safely gather latents for sampled indices
-            if latents.shape[0] > max(sample_index):
+            if num_samples == 0: # Handle edge case where sampling yields no indices
+                print("--- Pre-inference sampling resulted in 0 frames. Skipping pre-inference. ---")
+                latents_pre = None
+            elif latents.shape[0] > max(sample_index): # Safely gather latents for sampled indices
+                 print(f"--- Sampled {num_samples} indices for pre-inference: {sample_index[:10]}... ---") # Print first 10
                  latents_pre = torch.stack([latents[i] for i in sample_index])
+                 # Gather corresponding inputs
+                 validation_masks_input_pre = [validation_masks_input[i] for i in sample_index]
+                 validation_images_input_pre = [validation_images_input[i] for i in sample_index]
             else:
-                 print("ERROR: Not enough latents generated for pre-inference sampling.")
+                 print(f"ERROR: Not enough latents ({latents.shape[0]}) generated for pre-inference sampling (max index: {max(sample_index)}). Skipping pre-inference.")
                  latents_pre = None # Indicate failure/skip
 
             if latents_pre is not None: # Only proceed if latents were sampled correctly
                 # Ensure noise_pre matches the number of frames being processed (num_samples)
                 if noise_pre.shape[0] != num_samples:
                      print(f"Warning: Adjusting noise_pre shape from {noise_pre.shape[0]} to {num_samples} for pre-inference")
-                     # Use the first 'num_samples' noises from the base pattern
-                     noise_pre_adjusted = noise_pre[:num_samples]
+                     noise_pre_adjusted = noise_pre[:num_samples].clone() # Use clone to avoid modifying original noise_pre if needed elsewhere (though likely not here)
                 else:
                      noise_pre_adjusted = noise_pre
 
                 ## Add noise using the sampled latents and adjusted noise
                 noisy_latents_pre = self.noise_scheduler.add_noise(latents_pre, noise_pre_adjusted, timesteps_add_noise)
-                latents_pre = noisy_latents_pre # Use noisy latents as input to pipeline
+                latents_pre_input = noisy_latents_pre # Use noisy latents as input to pipeline
 
                 # Run the pipeline on the sampled subset
                 print(f"--- Calling pipeline for pre-inference ({num_samples} frames) ---")
@@ -480,202 +612,58 @@ class DiffuEraser:
                         num_inference_steps=self.num_inference_steps,
                         generator=generator,
                         guidance_scale=guidance_scale_final,
-                        latents=latents_pre, # Start from noisy latents
-                        output_type="latent" # Get latents directly if possible
+                        latents=latents_pre_input, # Start from noisy latents
+                        output_type="latent" # Get latents directly
                     )
-                    # Check if output is dictionary (newer Diffusers) or tuple
+                    # Check output format
                     if isinstance(pipeline_output, dict) and 'latents' in pipeline_output:
                          latents_pre_out = pipeline_output.latents
-                    elif isinstance(pipeline_output, DiffuEraserPipelineOutput): # Check for the specific output class
+                    elif isinstance(pipeline_output, DiffuEraserPipelineOutput):
                          latents_pre_out = pipeline_output.latents
                     else:
-                         # Fallback or assume it's just the latents tensor if not dict/specific class
-                         latents_pre_out = pipeline_output
+                         latents_pre_out = pipeline_output # Assume direct output
                          print("Warning: Pre-inference pipeline output format unexpected, assuming latents tensor.")
 
                 print(f"--- Pre-inference pipeline call complete ---")
                 torch.cuda.empty_cache()
+                del latents_pre_input, noisy_latents_pre, noise_pre_adjusted # Clean up intermediate tensors
 
-                # Decode latents and update original tensors
+                # Update main latents tensor with pre-inference results
                 if latents_pre_out is not None and latents_pre_out.shape[0] == num_samples:
-                    print(f"--- Decoding {num_samples} pre-inference latents ---")
-                    # Define local decode function to handle VAE device management
-                    def decode_latents_local(lats_to_decode, dtype):
-                        vae = self.pipeline.vae
-                        original_dev = vae.device
-                        try:
-                            vae.to(self.device)
-                            lats_to_decode = 1 / vae.config.scaling_factor * lats_to_decode.to(self.device)
-                            vid = []
-                            decode_batch_size = 4 # Decode in smaller batches if needed
-                            for t_idx in range(0, lats_to_decode.shape[0], decode_batch_size):
-                                batch_lats = lats_to_decode[t_idx : t_idx + decode_batch_size]
-                                vid.append(vae.decode(batch_lats.to(dtype)).sample)
-                            vid = torch.concat(vid, dim=0)
-                            return vid.float().cpu() # Return to CPU
-                        finally:
-                            vae.to(original_dev) # Return VAE to original device
-
-                    with torch.no_grad():
-                       video_tensor_temp = decode_latents_local(latents_pre_out, dtype=torch.float16)
-                       images_pre_out = self.image_processor.postprocess(video_tensor_temp, output_type="pil") # Output PIL images
-                    del video_tensor_temp
-                    torch.cuda.empty_cache()
-                    print(f"--- Decoded pre-inference images ---")
-
-                    ## ! --- ONLY UPDATE LATENTS --- !
-                    print(f"--- Updating main latents tensor ONLY with {len(sample_index)} pre-inference results ---") # Adjusted log
-                    for i, index in enumerate(sample_index): # Loop over correct indices
-                        if i < latents_pre_out.shape[0] and index < latents.shape[0]: # Removed check for images_pre_out length
-                            # Update latents (move pre-inf latent back to GPU for assignment)
-                            latents[index] = latents_pre_out[i].to(self.device)
-
-                            # --- REMOVED THE FOLLOWING LINES ---
-                            # validation_images_input[index] = images_pre_out[i]
-                            # resized_frames[index] = images_pre_out[i]
-                            # validation_masks_input[index] = black_image
-                            # --- END REMOVAL ---
+                    print(f"--- Updating main latents tensor with {num_samples} pre-inference results ---")
+                    for i, index in enumerate(sample_index):
+                        if i < latents_pre_out.shape[0] and index < latents.shape[0]:
+                            # Update latents (move pre-inf latent back to GPU if needed, already on device from pipeline)
+                            latents[index] = latents_pre_out[i] # Modify the input 'latents' tensor
                         else:
                             print(f"Warning: Index mismatch during pre-inference LATENT update (i={i}, index={index}). Skipping update for this index.")
-                    # del images_pre_out # Delete decoded images if not needed elsewhere (they aren't here)
-                    # if 'images_pre_out' in locals(): del images_pre_out # Safer deletion
-                    # torch.cuda.empty_cache() # Optional cache clearing
-
-                else: # If latents_pre_out was None or mismatch
+                    del latents_pre_out # Free memory
+                    torch.cuda.empty_cache()
+                else: # If latents_pre_out was None or shape mismatch
                      print("--- Skipping pre-inference result application due to missing/mismatched latents_pre_out ---")
-                     latents_pre_out = None # Ensure it's None
+                     if latents_pre_out is not None: del latents_pre_out # Clean up if exists
+                     latents_pre_out = None # Ensure it's None for logic flow
 
-            else: # latents_pre was None or pipeline failed
-                 print("--- Skipping pre-inference pipeline call due to sampling or other issues ---")
+            else: # latents_pre was None (sampling failed or error)
+                 print("--- Skipping pre-inference pipeline call due to sampling issues or condition not met ---")
                  latents_pre_out = None # Ensure it's None
 
         else: # real_video_length <= nframes * 2
             print("--- Skipping Pre-inference step (video too short or condition not met) ---")
-            latents_pre_out=None
-            sample_index=None
+            latents_pre_out = None # Ensure variable exists but is None
+            sample_index = None
 
+        # Final cleanup before returning
+        del noise_pre # Base noise pattern is no longer needed outside this scope
+        if 'latents_pre_out' in locals() and latents_pre_out is not None:
+            del latents_pre_out # Should have been deleted earlier, but just in case
+        if 'latents_pre' in locals() and latents_pre is not None:
+            del latents_pre # Sampled latents before noise addition
         gc.collect()
         torch.cuda.empty_cache()
 
-        ################  Main Frame-by-frame inference  ################
-        print(f"--- Starting main inference loop using nframes={nframes} ---")
-        ## Add noise to the potentially updated latents tensor
-        # Use the *full* noise tensor corresponding to real_video_length
-        noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps_add_noise)
-        latents = noisy_latents # Start main inference from this noisy state
-
-        # Clean up original noise tensor if no longer needed
-        del noise, noise_pre, noisy_latents
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        print(f"--- Calling main pipeline for {real_video_length} frames ---")
-        with torch.no_grad():
-            pipeline_output = self.pipeline(
-                num_frames=nframes, # Pass the chunk size parameter
-                prompt=validation_prompt,
-                images=validation_images_input, # Use potentially updated images
-                masks=validation_masks_input,   # Use potentially updated masks
-                num_inference_steps=self.num_inference_steps,
-                generator=generator,
-                guidance_scale=guidance_scale_final,
-                latents=latents, # Start from noisy latents
-                output_type="pil" # Get PIL images directly
-            )
-            # Check output format
-            if isinstance(pipeline_output, dict) and 'frames' in pipeline_output:
-                images = pipeline_output.frames
-            elif isinstance(pipeline_output, DiffuEraserPipelineOutput):
-                images = pipeline_output.frames
-            elif isinstance(pipeline_output, tuple): # Older format?
-                images = pipeline_output[0]
-                print("Warning: Main pipeline output format unexpected (tuple), assuming frames.")
-            else: # Assume direct frame output if not dict/tuple
-                 images = pipeline_output
-                 print("Warning: Main pipeline output format unexpected, assuming frames.")
-
-        # Ensure the number of output frames matches expected length
-        if len(images) < real_video_length:
-            print(f"Warning: Pipeline returned {len(images)} frames, expected {real_video_length}. Padding or error handling might be needed.")
-            # Handle discrepancy if necessary (e.g., repeat last frame, raise error)
-        images = images[:real_video_length] # Trim if pipeline returned more for some reason
-        print(f"--- Main inference pipeline call complete, received {len(images)} frames ---")
-
-        # Clean up large latent tensor
-        del latents
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        ################ Compose Final Video ################
-        print(f"--- Composing final video using original masks and frames ---")
-        binary_masks = validation_masks_input_ori # Use the original masks read from file
-        mask_blurreds = []
-        if blended:
-            print(f"--- Applying blur blending to masks ---")
-            # Consider optimizing GaussianBlur if it becomes a bottleneck (e.g., batching with kornia/cupy)
-            for i in range(len(binary_masks)):
-                mask_np = np.array(binary_masks[i])
-                # Ensure mask is single channel for blur
-                if mask_np.ndim == 3:
-                    mask_np = cv2.cvtColor(mask_np, cv2.COLOR_RGB2GRAY)
-                # Apply blur
-                mask_blurred_np = cv2.GaussianBlur(mask_np, (21, 21), 0) / 255.0
-                # Combine original mask with blurred mask (ensure binary_mask calculation is correct)
-                # Original intention might be: blend = mask * blur + (1-mask) * identity => use blur amount based on mask proximity
-                # Current calculation: 1 - (1 - mask/255) * (1 - blurred) -> check logic if results look odd
-                binary_mask_np = 1.0 - (1.0 - mask_np / 255.0) * (1.0 - mask_blurred_np)
-                mask_blurreds.append(Image.fromarray((binary_mask_np * 255).astype(np.uint8)))
-            binary_masks = mask_blurreds # Use the blurred versions for composition
-
-        comp_frames = []
-        # Use the original resized frames (before pre-inference updates) for non-masked areas
-        frames_for_composition = resized_frames_ori
-        print(f"--- Composing {len(images)} generated frames with original frames ---")
-        for i in range(len(images)):
-            # Ensure mask is broadcastable (H, W, 1)
-            mask_np = np.expand_dims(np.array(binary_masks[i]), axis=2) / 255.0 # Normalize mask
-            # Ensure frames are numpy arrays
-            img_generated_np = np.array(images[i]).astype(np.uint8)
-            img_original_np = np.array(frames_for_composition[i]).astype(np.uint8)
-
-            # Blend: generated * mask + original * (1 - mask)
-            img_comp_np = (img_generated_np * mask_np + img_original_np * (1.0 - mask_np)).astype(np.uint8)
-            comp_frames.append(Image.fromarray(img_comp_np))
-
-        del images, frames_for_composition, binary_masks, mask_blurreds # Free memory
-        gc.collect()
-
-        ################ Write Video ################
-        print(f"--- Writing final video to: {output_path} ---")
-        if not comp_frames:
-             print("Error: No frames to write to video!")
-             return None # Or raise error
-
-        default_fps = fps
-        # Use frame size from the composed frames
-        output_size = comp_frames[0].size
-        # Ensure fourcc is compatible
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v") # Common codec
-        writer = cv2.VideoWriter(output_path, fourcc, default_fps, output_size)
-
-        if not writer.isOpened():
-             print(f"Error: Could not open video writer for {output_path}")
-             return None
-
-        for f_idx, frame_pil in enumerate(comp_frames):
-            # Convert PIL Image to BGR numpy array for OpenCV
-            img_np_bgr = cv2.cvtColor(np.array(frame_pil), cv2.COLOR_RGB2BGR)
-            writer.write(img_np_bgr)
-            # Optional: Print progress
-            # if f_idx % 50 == 0:
-            #      print(f"--- Wrote frame {f_idx} ---")
-
-        writer.release()
-        print(f"--- Video writing complete ---")
-        ################################
-
-        return output_path
-            
-
+        # Return the full noise tensor and the timesteps for adding noise.
+        # The 'latents' tensor passed as input has been modified in-place if pre-inference ran.
+        return noise, timesteps_add_noise
 
 

@@ -1026,6 +1026,17 @@ class StableDiffusionDiffuEraserPipeline(
         )
         print(f"--- Device Setup: Target Computation Device = {unet_device}, CPU on {cpu_device} ---")
 
+        print("--- Explicitly moving Text Encoder and VAE to CPU before main loop ---")
+        if hasattr(self, 'text_encoder') and self.text_encoder is not None:
+            self.text_encoder.to('cpu')
+        if hasattr(self, 'vae') and self.vae is not None:
+            # VAE is needed again for decoding AFTER the loop, so offloading is fine.
+            self.vae.to('cpu')
+        if hasattr(self, 'image_encoder') and self.image_encoder is not None:
+             print("--- Offloading IP Adapter Image Encoder ---")
+             self.image_encoder.to('cpu')
+        gc.collect()
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
 
         # --- 5. Denoising loop ---
         with self.progress_bar(total=num_inference_steps) as progress_bar:
@@ -1536,7 +1547,7 @@ class StableDiffusionDiffuEraserPipeline(
             cond_scale = brushnet_cond_scale * brushnet_keep[i]
         # --- End Prepare BrushNet Inputs ---
 
-        # --- BrushNet Inference & Offload ---
+        # --- BrushNet Inference ---
         self.brushnet.to(unet_device)
         t_val = t if isinstance(t, int) else t.item() # For printing
         print(f"[t={t_val}, j={j}] Running BrushNet on {unet_device}...")
@@ -1551,7 +1562,7 @@ class StableDiffusionDiffuEraserPipeline(
         brushnet_cond_input = torch.cat([brushnet_cond_sliced]*2) if self.do_classifier_free_guidance else brushnet_cond_sliced
         brushnet_cond_input_gpu = brushnet_cond_input.to(unet_device) # Already on device, but ensures
 
-        # Run BrushNet
+        # Run BrushNet - Results stay on GPU
         down_block_res_samples, mid_block_res_sample, up_block_res_samples = self.brushnet(
             control_model_input_gpu,
             t,
@@ -1561,38 +1572,16 @@ class StableDiffusionDiffuEraserPipeline(
             guess_mode=guess_mode,
             return_dict=False,
         )
-        # Move results to CPU
-        print(f"[t={t_val}, j={j}] Moving BrushNet results to CPU...")
-        down_block_res_samples_cpu = [res.to(cpu_device) for res in down_block_res_samples]
-        mid_block_res_sample_cpu = mid_block_res_sample.to(cpu_device)
-        up_block_res_samples_cpu = [res.to(cpu_device) for res in up_block_res_samples]
 
-        # Clean up GPU tensors
-        del down_block_res_samples, mid_block_res_sample, up_block_res_samples
+        # Clean up BrushNet *INPUT* GPU tensors (Keep results on GPU)
         del control_model_input_gpu, brushnet_prompt_embeds_gpu, brushnet_cond_input_gpu, brushnet_cond_sliced
-        if torch.cuda.is_available(): torch.cuda.empty_cache()
-        print(f"[t={t_val}, j={j}] Cleared BrushNet GPU tensors.")
 
-        # Apply guess mode logic on CPU if needed
+        # Apply guess mode logic directly on GPU tensors if needed
         if guess_mode and self.do_classifier_free_guidance:
-            print(f"[t={t_val}, j={j}] Applying guess mode logic on CPU...")
-            down_block_res_samples_cpu = [torch.cat([torch.zeros_like(d), d]) for d in down_block_res_samples_cpu]
-            mid_block_res_sample_cpu = torch.cat([torch.zeros_like(mid_block_res_sample_cpu), mid_block_res_sample_cpu])
-            up_block_res_samples_cpu = [torch.cat([torch.zeros_like(d), d]) for d in up_block_res_samples_cpu]
-
-        # Move results back to GPU for UNet
-        print(f"[t={t_val}, j={j}] Moving BrushNet results back to {unet_device} for UNet...")
-        down_block_add_samples_gpu = [res.to(unet_device) for res in down_block_res_samples_cpu]
-        mid_block_add_sample_gpu = mid_block_res_sample_cpu.to(unet_device)
-        up_block_add_samples_gpu = [res.to(unet_device) for res in up_block_res_samples_cpu]
-
-        # Clean up CPU tensors
-        print(f"[t={t_val}, j={j}] Aggressively clearing cache before UNet...")
-        del down_block_res_samples_cpu, mid_block_res_sample_cpu, up_block_res_samples_cpu
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        # --- End BrushNet Section ---
+            print(f"[t={t_val}, j={j}] Applying guess mode logic on GPU...")
+            down_block_res_samples = [torch.cat([torch.zeros_like(d), d]) for d in down_block_res_samples]
+            mid_block_res_sample = torch.cat([torch.zeros_like(mid_block_res_sample), mid_block_res_sample])
+            up_block_res_samples = [torch.cat([torch.zeros_like(d), d]) for d in up_block_res_samples]
 
         # --- UNet Inference ---
         self.unet.to(unet_device)
@@ -1602,6 +1591,14 @@ class StableDiffusionDiffuEraserPipeline(
         unet_prompt_embeds_gpu = original_prompt_embeds.to(unet_device)
         timestep_cond_gpu = timestep_cond.to(unet_device) if timestep_cond is not None else None
 
+        # Assign BrushNet results (already on GPU) directly for UNet input
+        down_block_add_samples_unet = down_block_res_samples
+        mid_block_add_sample_unet = mid_block_res_sample
+        up_block_add_samples_unet = up_block_res_samples
+
+        # Clear cache here (Brush net causes a large vram growth)
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
+
         # Run UNet
         noise_pred = self.unet(
             latent_model_input_gpu, # Shape (2*T, C, H, W) or (T, C, H, W)
@@ -1609,18 +1606,19 @@ class StableDiffusionDiffuEraserPipeline(
             encoder_hidden_states=unet_prompt_embeds_gpu, # Shape (2*B, Seq, Dim) or (B, Seq, Dim)
             timestep_cond=timestep_cond_gpu,
             cross_attention_kwargs=self.cross_attention_kwargs,
-            down_block_add_samples=down_block_add_samples_gpu,
-            mid_block_add_sample=mid_block_add_sample_gpu,
-            up_block_add_samples=up_block_add_samples_gpu,
+            down_block_add_samples=down_block_add_samples_unet, # Directly use GPU tensors
+            mid_block_add_sample=mid_block_add_sample_unet,     # Directly use GPU tensors
+            up_block_add_samples=up_block_add_samples_unet,     # Directly use GPU tensors
             added_cond_kwargs=added_cond_kwargs,
             return_dict=False,
             num_frames=len(context), # Pass the length of the current context
         )[0] # noise_pred shape matches latent_model_input_gpu
 
-        # Clean up UNet inputs and BrushNet GPU results
-        print(f"[t={t_val}, j={j}] Deleting UNet inputs and BrushNet GPU results...")
-        del down_block_add_samples_gpu, mid_block_add_sample_gpu, up_block_add_samples_gpu
+        # Clean up UNet inputs and BrushNet GPU results (which were inputs to UNet)
+        del down_block_add_samples_unet, mid_block_add_sample_unet, up_block_add_samples_unet
         del latent_model_input_gpu, unet_prompt_embeds_gpu
+        if timestep_cond_gpu is not None: del timestep_cond_gpu
+        # Crucially clear cache *here* before the scheduler step if memory is tight
         if torch.cuda.is_available(): torch.cuda.empty_cache()
         # --- End UNet Section ---
 
@@ -1629,9 +1627,6 @@ class StableDiffusionDiffuEraserPipeline(
             noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
             noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
             del noise_pred_uncond, noise_pred_text # Delete chunks
-
-        # --- Scheduler Step ---
-        print(f"[t={t_val}, j={j}] Devices BEFORE scheduler step: latents_j={latents_j.device}, noise_pred={noise_pred.device}, t={'builtin' if isinstance(t,int) else t.device}")
 
         # Ensure inputs are on the correct device and correct type for scheduler
         noise_pred_step = noise_pred.to(unet_device)
@@ -1642,8 +1637,6 @@ class StableDiffusionDiffuEraserPipeline(
         else:
             # Ensure t is long and on the correct device
             t_step = t.to(device=unet_device, dtype=torch.long)
-
-        print(f"[t={t_val}, j={j}] Devices AFTER explicit .to(unet_device): latents_j={latents_j_step.device}, noise_pred={noise_pred_step.device}, t={t_step.device}")
 
         # Compute the previous noisy sample x_t -> x_t-1
         try:
@@ -1662,15 +1655,12 @@ class StableDiffusionDiffuEraserPipeline(
 
         # Clean up noise prediction and step-specific tensors
         del noise_pred, noise_pred_step, latents_j_step
-        if torch.cuda.is_available(): torch.cuda.empty_cache()
+        # Optional: Clear cache again if scheduler step itself used significant temporary memory
+        # if torch.cuda.is_available(): torch.cuda.empty_cache()
 
         # Result latents_j_out is on unet_device
         latents_j = latents_j_out # Reuse variable name for the output of the step
         # --- End Scheduler Step ---
-
-
-        # --- Update Accumulated Value and Count Tensors (In-Place) ---
-        print(f"[t={t_val}, j={j}] Devices BEFORE value update: value={value.device}, latents_j={latents_j.device}")
 
         # Ensure latents_j is definitely on the target device (redundant but safe)
         latents_j_update = latents_j.to(unet_device)
@@ -1710,7 +1700,6 @@ class StableDiffusionDiffuEraserPipeline(
                 # Assign the non-overlapping part (overwrite)
                 assign_start_local_idx = overlap_indices_local[-1] + 1
                 if assign_start_local_idx < len(context): # Check if there are non-overlapping frames
-                    print(f"[t={t_val}, j={j}] Assigning non-overlap from local index {assign_start_local_idx}...")
                     # Get global indices for assignment
                     assign_global_indices = context[assign_start_local_idx:]
                     # Get corresponding latents data
@@ -1720,8 +1709,6 @@ class StableDiffusionDiffuEraserPipeline(
                 # No overlap found with previous windows in this timestep
                 print(f"[t={t_val}, j={j}] Assigning full chunk (j>0, no overlap found)...")
                 value[context, ...] = latents_j_update # Assign the whole chunk
-
-        print(f"[t={t_val}, j={j}] Device AFTER value update: value={value.device}")
         # --- End Update Section ---
 
         # Return the modified tensors (caller will use them)
