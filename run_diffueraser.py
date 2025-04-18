@@ -31,7 +31,6 @@ def main():
     
     ## model initialization
     device = get_device()
-    device = torch.device('cpu')
     # PCM params
     ckpt = "2-Step"
     video_inpainting_sd = DiffuEraser(device, args.base_model_path, args.vae_path, args.diffueraser_path, ckpt=ckpt)

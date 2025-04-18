@@ -22,7 +22,7 @@ from transformers import AutoTokenizer, PretrainedConfig
 from libs.unet_motion_model import MotionAdapter, UNetMotionModel
 from libs.brushnet_CA import BrushNetModel
 from libs.unet_2d_condition import UNet2DConditionModel
-from diffueraser.pipeline_diffueraser import StableDiffusionDiffuEraserPipeline
+from diffueraser.pipeline_diffueraser import StableDiffusionDiffuEraserPipeline, DiffuEraserPipelineOutput
 
 
 checkpoints = {
@@ -216,12 +216,21 @@ class DiffuEraser:
             self.brushnet.to(self.device, torch.float16)
             self.unet_main.to(self.device, torch.float16)
             self.pipeline.to(self.device, torch.float16)
-        else:
             try:
                 self.pipeline.enable_model_cpu_offload()
                 print("--- Enabled Model CPU Offload ---")
             except AttributeError:
                 print("--- Model CPU Offload not directly supported by this pipeline version/structure ---")
+
+        try:
+            # Check if xformers is installed and pipeline supports it
+            if hasattr(self.pipeline, "enable_xformers_memory_efficient_attention"):
+                 self.pipeline.enable_xformers_memory_efficient_attention()
+                 print("--- Enabled xFormers memory-efficient attention ---")
+            else:
+                 print("--- xFormers not available or not supported by this pipeline version ---")
+        except Exception as e:
+            print(f"--- Failed to enable xFormers: {e}. Using default attention. ---")
 
         #  Explicit Gradient Checkpointing (Optional but recommended)
         print("--- Explicitly enabling gradient checkpointing for UNet and BrushNet ---")
