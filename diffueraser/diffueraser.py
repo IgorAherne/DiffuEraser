@@ -199,8 +199,8 @@ class DiffuEraser:
         self.text_encoder = text_encoder_cls.from_pretrained(
                 base_model_path, subfolder="text_encoder"
             )
-        self.brushnet = BrushNetModel.from_pretrained(diffueraser_path, subfolder="brushnet").to(self.device, torch.float16)
-        self.unet_main = UNetMotionModel.from_pretrained(diffueraser_path, subfolder="unet_main").to(self.device, torch.float16)
+        self.brushnet = BrushNetModel.from_pretrained(diffueraser_path, subfolder="brushnet")
+        self.unet_main = UNetMotionModel.from_pretrained(diffueraser_path, subfolder="unet_main")
 
         ## set pipeline
         self.pipeline = StableDiffusionDiffuEraserPipeline.from_pretrained(
@@ -210,20 +210,26 @@ class DiffuEraser:
             tokenizer=self.tokenizer,
             unet=self.unet_main,
             brushnet=self.brushnet,
-        ).to(self.device, torch.float16)
+        )
+
+        if(self.device != torch.device("cpu")):
+            self.brushnet.to(self.device, torch.float16)
+            self.unet_main.to(self.device, torch.float16)
+            self.pipeline.to(self.device, torch.float16)
+        else:
+            try:
+                self.pipeline.enable_model_cpu_offload()
+                print("--- Enabled Model CPU Offload ---")
+            except AttributeError:
+                print("--- Model CPU Offload not directly supported by this pipeline version/structure ---")
 
         #  Explicit Gradient Checkpointing (Optional but recommended)
         print("--- Explicitly enabling gradient checkpointing for UNet and BrushNet ---")
         if hasattr(self.pipeline.unet, "enable_gradient_checkpointing"):
-             self.pipeline.unet.enable_gradient_checkpointing()
+            self.pipeline.unet.enable_gradient_checkpointing()
         if hasattr(self.pipeline.brushnet, "enable_gradient_checkpointing"):
-             self.pipeline.brushnet.enable_gradient_checkpointing()
+            self.pipeline.brushnet.enable_gradient_checkpointing()
 
-        try:
-            self.pipeline.enable_model_cpu_offload()
-            print("--- Enabled Model CPU Offload ---")
-        except AttributeError:
-             print("--- Model CPU Offload not directly supported by this pipeline version/structure ---")
         self.pipeline.scheduler = UniPCMultistepScheduler.from_config(self.pipeline.scheduler.config)
         self.pipeline.set_progress_bar_config(disable=True)
 
@@ -343,7 +349,9 @@ class DiffuEraser:
 
                     # Preprocess only the current batch
                     batch_tensor = [self.image_processor.preprocess(img, height=tar_height, width=tar_width).to(dtype=torch.float32) for img in batch_pil]
-                    batch_tensor = torch.cat(batch_tensor).to(device=self.device, dtype=torch.float16) # Process in float16
+
+                    wanted_dtype = torch.float32 if self.device==torch.device("cpu") else torch.float16 # Process in float16 if GPU
+                    batch_tensor = torch.cat(batch_tensor).to(device=self.device, dtype=wanted_dtype) 
 
                     # Encode the batch
                     batch_latents = vae_module.encode(batch_tensor).latent_dist.sample()
@@ -392,7 +400,7 @@ class DiffuEraser:
         elif hasattr(self.pipeline, 'unet') and self.pipeline.unet is not None:
             prompt_embeds_dtype = self.pipeline.unet.dtype
         else:
-            prompt_embeds_dtype = torch.float16 # Default fallback
+            prompt_embeds_dtype = torch.float32 if self.device==torch.device("cpu") else torch.float16 # Default fallback
 
         print(f"--- Preparing base noise for shape {shape} with dtype {prompt_embeds_dtype} ---")
         noise_pre = randn_tensor(shape, device=self.device, dtype=prompt_embeds_dtype, generator=generator)
