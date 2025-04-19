@@ -144,10 +144,10 @@ def read_priori(priori, fps, n_total_frames, img_size):
 
     return prioris
 
-def read_video(validation_image, video_length, nframes, max_img_size):
-    vframes, aframes, info = torchvision.io.read_video(filename=validation_image, pts_unit='sec', end_pts=video_length) # RGB
+def read_video(validation_image, max_video_length, nframes, max_img_size):
+    vframes, aframes, info = torchvision.io.read_video(filename=validation_image, pts_unit='sec', end_pts=max_video_length) # RGB
     fps = info['video_fps']
-    n_total_frames = int(video_length * fps)
+    n_total_frames = int(max_video_length * fps)
     n_clip = int(np.ceil(n_total_frames/nframes))
 
     frames = list(vframes.numpy())[:n_total_frames]
@@ -265,7 +265,7 @@ class DiffuEraser:
     
 
     def forward(self, validation_image, validation_mask, priori, output_path,
-                max_img_size = 1280, video_length=2, mask_dilation_iter=4,
+                max_img_size = 1280, max_video_length=2, mask_dilation_iter=4,
                 nframes=22, # Keep this default or set slightly lower (e.g., 16, 18) if needed
                 seed=None, revision = None, guidance_scale=None, blended=True):
         validation_prompt = ""
@@ -276,7 +276,7 @@ class DiffuEraser:
 
         ################ read input video ################
         print(f"--- Reading video: {validation_image} ---")
-        frames, fps, img_size, n_clip, n_total_frames = read_video(validation_image, video_length, nframes, max_img_size)
+        frames, fps, img_size, n_clip, n_total_frames = read_video(validation_image, max_video_length, nframes, max_img_size)
         video_len = len(frames)
         print(f"--- Video read: {video_len} frames, FPS: {fps}, Size: {img_size}, Target nframes: {nframes} ---")
 

@@ -6,12 +6,11 @@ from diffueraser.diffueraser import DiffuEraser
 from propainter.inference import Propainter, get_device
 
 def main():
-
     ## input params
     parser = argparse.ArgumentParser()
     parser.add_argument('--input_video', type=str, default="examples/example3/video.mp4", help='Path to the input video')
     parser.add_argument('--input_mask', type=str, default="examples/example3/mask.mp4" , help='Path to the input mask')
-    parser.add_argument('--video_length', type=int, default=10, help='The maximum length of output video')
+    parser.add_argument('--max_video_length', type=float, default=9999999.0, help='The maximum length of output video')
     parser.add_argument('--mask_dilation_iter', type=int, default=8, help='Adjust it to change the degree of mask expansion')
     parser.add_argument('--max_img_size', type=int, default=960, help='The maximum length of output width and height')
     parser.add_argument('--save_path', type=str, default="results" , help='Path to the output')
@@ -39,14 +38,14 @@ def main():
     start_time = time.time()
 
     ## priori
-    propainter.forward(args.input_video, args.input_mask, priori_path, video_length=args.video_length, 
+    propainter.forward(args.input_video, args.input_mask, priori_path, video_length=args.max_video_length, 
                         ref_stride=args.ref_stride, neighbor_length=args.neighbor_length, subvideo_length = args.subvideo_length,
                         mask_dilation = args.mask_dilation_iter) 
 
     ## diffueraser
     guidance_scale = None    # The default value is 0.  
     video_inpainting_sd.forward(args.input_video, args.input_mask, priori_path, output_path,
-                                max_img_size = args.max_img_size, video_length=args.video_length, mask_dilation_iter=args.mask_dilation_iter,
+                                max_img_size = args.max_img_size, max_video_length=args.max_video_length, mask_dilation_iter=args.mask_dilation_iter,
                                 guidance_scale=guidance_scale)
     
     end_time = time.time()  
