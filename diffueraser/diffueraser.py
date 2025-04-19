@@ -265,7 +265,7 @@ class DiffuEraser:
     
 
     def forward(self, validation_image, validation_mask, priori, output_path,
-                max_img_size = 1280, max_video_length=2, mask_dilation_iter=4,
+                max_img_size = 1280, max_video_length=10, mask_dilation_iter=4,
                 nframes=22, # Keep this default or set slightly lower (e.g., 16, 18) if needed
                 seed=None, revision = None, guidance_scale=None, blended=True):
         validation_prompt = ""
