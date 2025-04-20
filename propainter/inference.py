@@ -496,7 +496,7 @@ class Propainter:
                                 fps, (comp_frames[0].shape[1],comp_frames[0].shape[0]))
         for f in range(video_length):
             frame = comp_frames[f].astype(np.uint8)
-            writer.write(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)) #Correct coversion RGB --> BGR
         writer.release()
         
         torch.cuda.empty_cache()
