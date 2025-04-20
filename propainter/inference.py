@@ -31,18 +31,23 @@ pretrain_model_url = 'https://github.com/sczhou/ProPainter/releases/download/v0.
 MaxSideThresh = 960
 
 
-# resize frames
-def resize_frames(frames, size=None):    
+def resize_frames(frames, size=None):
     if size is not None:
         out_size = size
-        process_size = (out_size[0]-out_size[0]%8, out_size[1]-out_size[1]%8)
-        frames = [f.resize(process_size) for f in frames]
+        # Ensure dimensions are at least 8x8 after rounding down
+        process_width = max(8, out_size[0] - out_size[0] % 8)
+        process_height = max(8, out_size[1] - out_size[1] % 8)
+        process_size = (process_width, process_height)
+        # Use LANCZOS for higher quality resizing
+        frames = [f.resize(process_size, Image.Resampling.LANCZOS) for f in frames] # Use Image.LANCZOS for older PIL
     else:
+        # handle case where size is None, ensure divisibility by 8 here too if needed
         out_size = frames[0].size
-        process_size = (out_size[0]-out_size[0]%8, out_size[1]-out_size[1]%8)
+        process_width = max(8, out_size[0] - out_size[0] % 8)
+        process_height = max(8, out_size[1] - out_size[1] % 8)
+        process_size = (process_width, process_height)
         if not out_size == process_size:
-            frames = [f.resize(process_size) for f in frames]
-        
+             frames = [f.resize(process_size, Image.Resampling.LANCZOS) for f in frames] # Use Image.LANCZOS for older PIL
     return frames, process_size, out_size
 
 #  read frames from video
@@ -172,6 +177,8 @@ class Propainter:
                                         model_dir=propainter_model_dir, progress=True, file_name=None)
         self.model = InpaintGenerator(model_path=ckpt_path).to(device)
         self.model.eval()
+
+
     def forward(self, video, mask, output_path, resize_ratio=0.6, video_length=2, height=-1, width=-1,
                 mask_dilation=4, ref_stride=10, neighbor_length=10, subvideo_length=80,
                 raft_iter=20, save_fps=24, save_frames=False, fp16=True):
@@ -490,13 +497,25 @@ class Propainter:
             
             torch.cuda.empty_cache()
 
-        ##save composed video##
-        comp_frames = [cv2.resize(f, out_size) for f in comp_frames]
+        # Use process_size if it differs from out_size and resize is necessary
+        final_output_size = out_size # Default to original target
+        if size != out_size:
+             print(f"Warning: Processing size {size} differs from initial target {out_size}. Adjusting final output or resize.")
+             # Output at processing size (might avoid final resize)
+             final_output_size = size
+             comp_frames_final = comp_frames # No resize needed if already at process_size internally
+
+        # Choose Option A or B above. Let's assume Option A for simplicity:
+        final_output_size = size
+        comp_frames_final = comp_frames
+
         writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"),
-                                fps, (comp_frames[0].shape[1],comp_frames[0].shape[0]))
+                                fps, final_output_size) # Use the determined final size
         for f in range(video_length):
-            frame = comp_frames[f].astype(np.uint8)
-            writer.write(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            # Ensure frame is uint8 before conversion
+            frame_rgb_uint8 = comp_frames_final[f].astype(np.uint8)
+            frame_bgr = cv2.cvtColor(frame_rgb_uint8, cv2.COLOR_RGB2BGR) # CORRECT CONVERSION
+            writer.write(frame_bgr)
         writer.release()
         
         torch.cuda.empty_cache()

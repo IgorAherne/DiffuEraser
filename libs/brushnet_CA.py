@@ -779,7 +779,7 @@ class BrushNetModel(ModelMixin, ConfigMixin):
         time_embedding_dtype = next(self.time_embedding.parameters()).dtype
         t_emb = t_emb.to(dtype=time_embedding_dtype)
 
-        # Check/Cast for timestep_cond ---
+        # Check/Cast for timestep_cond
         if timestep_cond is not None and timestep_cond.dtype != time_embedding_dtype:
             timestep_cond = timestep_cond.to(dtype=time_embedding_dtype)
 
