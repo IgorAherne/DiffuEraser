@@ -38,7 +38,8 @@ def main():
     device = get_device()
     # PCM params
     ckpt = "2-Step"
-    video_inpainting_sd = DiffuEraser(device, args.base_model_path, args.vae_path, args.diffueraser_path, ckpt=ckpt)
+    video_inpainting_sd = DiffuEraser(device,  args.base_model_path,  args.vae_path,  args.diffueraser_path, 
+                                      args.ffmpeg_path,  args.ffprobe_path,  ckpt=ckpt)
 
     propainter = Propainter(propainter_model_dir=args.propainter_model_dir, 
                             device=device, 
@@ -48,13 +49,17 @@ def main():
     start_time = time.time()
 
     ## priori
-    propainter.forward(args.input_video, args.input_mask, priori_path, video_length=args.max_video_length, 
-                        ref_stride=args.ref_stride, neighbor_length=args.neighbor_length, subvideo_length = args.subvideo_length,
-                        mask_dilation = args.mask_dilation_iter) 
+    propainter.forward( video=args.input_video,  mask=args.input_mask,  output_path=priori_path, 
+                        save_mode=args.save_mode,
+                        video_length=args.max_video_length, 
+                        ref_stride=args.ref_stride,  neighbor_length=args.neighbor_length,  
+                        subvideo_length=args.subvideo_length,
+                        mask_dilation=args.mask_dilation_iter ) 
 
     ## diffueraser
     guidance_scale = None    # The default value is 0.  
     video_inpainting_sd.forward(args.input_video, args.input_mask, priori_path, output_path,
+                                save_mode=args.save_mode,
                                 max_img_size = args.max_img_size, max_video_length=args.max_video_length, mask_dilation_iter=args.mask_dilation_iter,
                                 guidance_scale=guidance_scale)
     
@@ -67,5 +72,3 @@ def main():
 if __name__ == '__main__':
     main()
 
-
-   

@@ -23,7 +23,7 @@ from libs.unet_motion_model import MotionAdapter, UNetMotionModel
 from libs.brushnet_CA import BrushNetModel
 from libs.unet_2d_condition import UNet2DConditionModel
 from diffueraser.pipeline_diffueraser import StableDiffusionDiffuEraserPipeline, DiffuEraserPipelineOutput
-
+from propainter.utils.video_read_write import read_frames_high_fidelity_ffmpeg, write_video_with_ffmpeg
 
 checkpoints = {
     "2-Step": ["pcm_{}_smallcfg_2step_converted.safetensors", 2, 0.0],
@@ -259,10 +259,14 @@ def read_video(validation_image, max_video_length, nframes, max_img_size):
 
 class DiffuEraser:
     def __init__(
-            self, device, base_model_path, vae_path, diffueraser_path, revision=None,
+            self, device, base_model_path, vae_path, diffueraser_path, 
+            ffmpeg_path="ffmpeg",
+            ffprobe_path="ffprobe",
+            revision=None,
             ckpt="Normal CFG 4-Step", mode="sd15", loaded=None):
         self.device = device
-
+        self.ffmpeg_path = ffmpeg_path
+        self.ffprobe_path = ffprobe_path
         ## load model
         self.vae = AutoencoderKL.from_pretrained(vae_path)
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -307,13 +311,6 @@ class DiffuEraser:
         except Exception as e:
             print(f"--- Failed to enable xFormers: {e}. Using default attention. ---")
 
-        #  Explicit Gradient Checkpointing
-        # print("--- Explicitly enabling gradient checkpointing for UNet and BrushNet ---")
-        # if hasattr(self.pipeline.unet, "enable_gradient_checkpointing"):
-        #     self.pipeline.unet.enable_gradient_checkpointing()
-        # if hasattr(self.pipeline.brushnet, "enable_gradient_checkpointing"):
-        #     self.pipeline.brushnet.enable_gradient_checkpointing()
-
         self.pipeline.scheduler = UniPCMultistepScheduler.from_config(self.pipeline.scheduler.config)
         self.pipeline.set_progress_bar_config(disable=True)
 
@@ -345,7 +342,9 @@ class DiffuEraser:
         self.guidance_scale = 0
     
 
+
     def forward(self, validation_image, validation_mask, priori, output_path,
+                save_mode='lossless_ffv1_rgb',
                 max_img_size = 1280, max_video_length=10, mask_dilation_iter=4,
                 nframes=22, # Keep this default or set slightly lower (e.g., 16, 18) if needed
                 seed=None, revision = None, guidance_scale=None, blended=True):
@@ -355,46 +354,165 @@ class DiffuEraser:
         if (max_img_size<256 or max_img_size>1920): # Increased upper limit slightly based on code analysis
             raise ValueError("The max_img_size must be between 256 and 1920.")
 
-        ################ read input video ################
-        print(f"--- Reading video: {validation_image} ---")
-        frames, fps, img_size, n_clip, n_total_frames = read_video(validation_image, max_video_length, nframes, max_img_size)
-        video_len = len(frames)
-        print(f"--- Video read: {video_len} frames, FPS: {fps}, Size: {img_size}, Target nframes: {nframes} ---")
+        ############### read input video ################
+        print(f"--- Reading video: {validation_image} using FFmpeg ---")
+        try:
+            frames_pil, fps, img_size, color_info, n_total_frames = read_frames_high_fidelity_ffmpeg(
+                video_path=validation_image,
+                max_length=max_video_length if max_video_length > 0 else 99999.0,
+                ffmpeg_exe_path=self.ffmpeg_path, # Use stored path
+                ffprobe_exe_path=self.ffprobe_path # Use stored path
+            )
+            if not frames_pil: raise ValueError("FFmpeg reader returned no frames.")
+            frames = frames_pil # Assign to the variable name used later
+        except Exception as e:
+             print(f"FATAL ERROR reading video with FFmpeg: {e}")
+             raise # Re-raise the error to stop execution
+        video_len = len(frames) # video_len is now n_total_frames directly
+        print(f"--- Video read: {video_len} frames, FPS: {fps}, Size: {img_size} ---")
 
         ################     read mask    ################
         print(f"--- Reading mask: {validation_mask} ---")
-        validation_masks_input, validation_images_input = read_mask(validation_mask, fps, video_len, img_size, mask_dilation_iter, frames)
-        print(f"--- Mask read: {len(validation_masks_input)} masks, {len(validation_images_input)} masked images ---")
+        mask_frames_pil = []
+        # Determine if mask is a video or image
+        mask_is_video = validation_mask.lower().endswith(('.mp4', '.mov', '.avi'))
+
+        if mask_is_video:
+            print("--- Mask is video, reading with FFmpeg ---")
+            try:
+                mask_frames_pil, mask_fps, mask_size, _, mask_frames_read = read_frames_high_fidelity_ffmpeg(
+                    video_path=validation_mask,
+                    max_length=max_video_length if max_video_length > 0 else 99999.0,
+                    ffmpeg_exe_path=self.ffmpeg_path,
+                    ffprobe_exe_path=self.ffprobe_path
+                )
+                if not mask_frames_pil: raise ValueError("FFmpeg mask reader returned no frames.")
+                # Optional: Check consistency
+                if abs(mask_fps - fps) > 0.1: print(f"Warning: Mask FPS {mask_fps} differs significantly from video FPS {fps}.")
+                if mask_size != img_size: print(f"Warning: Mask size {mask_size} differs from video size {img_size}. Resizing mask.")
+                if mask_frames_read < video_len: print(f"Warning: Mask video has fewer frames ({mask_frames_read}) than video ({video_len}).")
+                # Trim or pad mask_frames_pil if necessary to match video_len (simplest: trim)
+                mask_frames_pil = mask_frames_pil[:video_len]
+
+            except Exception as e:
+                 print(f"FATAL ERROR reading mask video with FFmpeg: {e}")
+                 raise
+        else:
+            print("--- Mask is image, reading with PIL ---")
+            try:
+                # Read single image mask
+                mask_img = Image.open(validation_mask)
+                # Repeat the single mask for all video frames
+                mask_frames_pil = [mask_img] * video_len
+            except Exception as e:
+                 print(f"FATAL ERROR reading mask image: {e}")
+                 raise
+        # Process mask frames (dilation, create masked images)
+        print(f"--- Processing {len(mask_frames_pil)} mask frames (dilation, creating masked images) ---")
+        validation_masks_input = [] # Will store dilated PIL masks
+        validation_images_input = [] # Will store masked PIL images
+        for i in range(video_len): # Iterate up to the actual video length
+            if i >= len(mask_frames_pil):
+                print(f"Warning: Ran out of mask frames at index {i}. Using last available mask.")
+                mask_pil = mask_frames_pil[-1] # Reuse last mask
+            else:
+                mask_pil = mask_frames_pil[i]
+
+            # Resize mask to match video frame size (use LANCZOS for consistency if possible, else NEAREST)
+            if mask_pil.size != img_size:
+                # Use LANCZOS if high quality is needed, NEAREST if strict binary mask preferred
+                mask_pil = mask_pil.resize(img_size, Image.Resampling.NEAREST)
+
+            # Convert to grayscale and NumPy
+            mask_np = np.array(mask_pil.convert('L'))
+
+            # Perform dilation (using cv2 like original `read_mask` for consistency)
+            m = np.array(mask_np > 0).astype(np.uint8) # Binarize
+            
+            # --- Dilation step ---
+            if mask_dilation_iter > 0:
+                m = cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=mask_dilation_iter)
+
+            # Store dilated mask as PIL Image
+            dilated_mask_pil = Image.fromarray(m * 255)
+            validation_masks_input.append(dilated_mask_pil)
+
+            # Create masked image (using the correctly read `frames`)
+            frame_np = np.array(frames[i]) # Get the corresponding video frame
+            mask_for_apply = np.expand_dims(m, axis=2) # Shape (H, W, 1), values 0 or 1
+            masked_image_np = frame_np * (1 - mask_for_apply) # Apply mask (0 keeps original, 1 makes black)
+            masked_image_pil = Image.fromarray(masked_image_np.astype(np.uint8))
+            validation_images_input.append(masked_image_pil)
+
+        del mask_frames_pil # Free memory
+        gc.collect()
+        print(f"--- Mask processing complete: {len(validation_masks_input)} masks, {len(validation_images_input)} masked images ---")
 
         ################    read priori   ################
-        print(f"--- Reading priori: {priori} ---")
-        prioris = read_priori(priori, fps, n_total_frames, img_size)
+        print(f"--- Reading priori: {priori} using FFmpeg ---")
+        try:
+            priori_frames_pil, priori_fps, priori_size, _, priori_frames_read = read_frames_high_fidelity_ffmpeg(
+                video_path=priori,
+                max_length=0, # Read full priori video
+                ffmpeg_exe_path=self.ffmpeg_path,
+                ffprobe_exe_path=self.ffprobe_path
+            )
+            if not priori_frames_pil: raise ValueError("FFmpeg priori reader returned no frames.")
+            prioris = priori_frames_pil # Assign to variable name used later
+
+            # Optional: Consistency checks
+            if abs(priori_fps - fps) > 0.1: print(f"Warning: Priori FPS {priori_fps} differs from video FPS {fps}.")
+            if priori_size != img_size: print(f"Warning: Priori size {priori_size} differs from video size {img_size}. Priori frames will be used as is.")
+            if priori_frames_read != video_len: print(f"Warning: Priori frames read ({priori_frames_read}) differs from video length ({video_len}). Using {priori_frames_read} frames.")
+            # Update video_len based on shortest input
+            video_len = min(video_len, priori_frames_read) # Adjust length based on actual priori frames
+        except Exception as e:
+            print(f"FATAL ERROR reading priori video with FFmpeg: {e}")
+            raise
+
+        os.remove(priori) # Keep removal of the intermediate file
         print(f"--- Priori read: {len(prioris)} frames ---")
 
         ## recheck frame counts and trim lists to the minimum common length
-        n_total_frames = min(len(frames), len(validation_masks_input), len(prioris))
-        if(n_total_frames < nframes): # Check against the actual nframes used
-            raise ValueError(f"The effective video duration ({n_total_frames} frames) is shorter than nframes ({nframes}). Processing requires at least nframes.")
-        if n_total_frames < 22 and nframes >= 22: # Retain original check related to minimum practical length?
-             print(f"Warning: Effective video duration ({n_total_frames} frames) is less than 22, but proceeding with nframes={nframes}.")
-
-        validation_masks_input = validation_masks_input[:n_total_frames]
-        validation_images_input = validation_images_input[:n_total_frames]
-        frames = frames[:n_total_frames]
-        prioris = prioris[:n_total_frames]
+        # This block might need adjustment based on the new video_len update above
+        n_total_frames = min(video_len, len(validation_masks_input), len(prioris)) # Use updated video_len
+        if n_total_frames != video_len:
+             print(f"--- Trimming all inputs to shortest length: {n_total_frames} frames ---")
+             # Trim all lists to the actual shortest length determined
+             validation_masks_input = validation_masks_input[:n_total_frames]
+             validation_images_input = validation_images_input[:n_total_frames]
+             frames = frames[:n_total_frames] # Trim original frames list too
+             prioris = prioris[:n_total_frames]
+        # Check nframes requirement again AFTER trimming
+        if(n_total_frames < nframes):
+            raise ValueError(f"The final effective video duration ({n_total_frames} frames) is shorter than nframes ({nframes}). Processing requires at least nframes.")
         real_video_length = n_total_frames # Use this consistent length
-        print(f"--- Adjusted lists to effective length: {real_video_length} frames ---")
+        print(f"--- Confirmed final effective length: {real_video_length} frames ---")
 
-        # Resize frames (ensure consistent size before processing)
-        prioris = resize_frames(prioris, img_size)
-        validation_masks_input = resize_frames(validation_masks_input, img_size)
-        validation_images_input = resize_frames(validation_images_input, img_size)
-        resized_frames = resize_frames(frames, img_size) # Keep original frames if needed for compose?
-        resized_frames_ori = copy.deepcopy(resized_frames) # Keep a copy of input frames for final composition
-        validation_masks_input_ori = copy.deepcopy(validation_masks_input) # Keep copy of original masks for final composition
+        print(f"--- Verifying final frame sizes against target: {img_size} ---")
+        # --- Update Resizing Calls / Verification ---
+        # Check if resizing is still needed after FFmpeg read (img_size should be correct now)
+        if prioris[0].size != img_size:
+             print(f"Warning: Resizing prioris from {prioris[0].size} to {img_size}")
+             prioris = resize_frames(prioris, img_size) # Use your resize_frames function
+        if validation_masks_input[0].size != img_size:
+             print(f"Warning: Resizing masks from {validation_masks_input[0].size} to {img_size}")
+             validation_masks_input = resize_frames(validation_masks_input, img_size)
+        if validation_images_input[0].size != img_size:
+             print(f"Warning: Resizing masked images from {validation_images_input[0].size} to {img_size}")
+             validation_images_input = resize_frames(validation_images_input, img_size)
+        if frames[0].size != img_size: # Check the original frames list
+             print(f"Warning: Resizing original frames from {frames[0].size} to {img_size}")
+             resized_frames = resize_frames(frames, img_size)
+        else:
+             resized_frames = frames # No resize needed if size matches
+        # Create deep copies *after* potential resizing for final composition
+        resized_frames_ori = copy.deepcopy(resized_frames)
+        validation_masks_input_ori = copy.deepcopy(validation_masks_input)
+        print(f"--- Final processing dimensions confirmed: {resized_frames_ori[0].size} ---")
 
-        # Get final target dimensions
-        tar_width, tar_height = resized_frames[0].size
+        # Get final target dimensions (redundant if assigned above, but safe)
+        tar_width, tar_height = resized_frames_ori[0].size
         print(f"--- Final processing dimensions: {tar_width}x{tar_height} ---")
 
         ##############################################
@@ -548,8 +666,8 @@ class DiffuEraser:
         print(f"--- Composing {len(images)} generated frames with original frames ---")
         for i in range(len(images)):
             if i >= len(frames_for_composition) or i >= len(binary_masks):
-                 print(f"Warning: Skipping composition for frame {i} due to list length mismatch.")
-                 continue # Skip if lists are somehow shorter than generated images
+                print(f"Warning: Skipping composition for frame {i} due to list length mismatch.")
+                continue # Skip if lists are somehow shorter than generated images
 
             mask_np = np.expand_dims(np.array(binary_masks[i]), axis=2) / 255.0
             img_generated_np = np.array(images[i]).astype(np.uint8)
@@ -564,30 +682,34 @@ class DiffuEraser:
         gc.collect()
 
         ################ Write Video ################
-        print(f"--- Writing final video to: {output_path} ---")
+        print(f"--- Writing final video (Mode: {save_mode}) to: {output_path} using FFmpeg ---") # Log the mode
         if not comp_frames:
              print("Error: No frames to write to video!")
-             # Clean up potentially opened resources if needed before returning
-             return None # Or raise error
-
-        default_fps = fps
-        output_size = comp_frames[0].size
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v") # Common codec
-        writer = cv2.VideoWriter(output_path, fourcc, default_fps, output_size)
-
-        if not writer.isOpened():
-             print(f"Error: Could not open video writer for {output_path}")
              return None
-
+        # Prepare frames as list of NumPy uint8 RGB arrays
+        frames_np_list = [np.array(frame_pil).astype(np.uint8) for frame_pil in comp_frames]
         try:
-            for f_idx, frame_pil in enumerate(comp_frames):
-                img_np_bgr = cv2.cvtColor(np.array(frame_pil), cv2.COLOR_RGB2BGR)
-                writer.write(img_np_bgr)
-        finally:
-             writer.release() # Ensure writer is released even if errors occur during write
+            write_video_with_ffmpeg(
+                frames_list=frames_np_list,
+                output_path=output_path,
+                fps=fps,
+                size=frames_np_list[0].shape[1::-1], # Get (width, height) from np array
+                original_video_path=validation_image, # Pass original crop for YUV tag probing if using YUV save_mode
+                ffmpeg_exe_path=self.ffmpeg_path, # Use stored path
+                ffprobe_exe_path=self.ffprobe_path, # Use stored path
+                save_mode=save_mode
+            )
+            print(f"--- Video writing complete (Mode: {save_mode}) ---")
+        except Exception as e:
+             print(f"ERROR during FFmpeg video saving in DiffuEraser: {e}")
+             # Handle error, maybe try to delete partial output file
+             if os.path.exists(output_path):
+                 try: os.remove(output_path)
+                 except OSError: pass
+             return None # Indicate failure
 
-        print(f"--- Video writing complete ---")
-
+        del frames_np_list# Cleanup intermediate NumPy list if large
+        gc.collect()
         return output_path
             
 
