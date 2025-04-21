@@ -21,6 +21,12 @@ def main():
     parser.add_argument('--vae_path', type=str, default="weights/sd-vae-ft-mse" , help='Path to vae')
     parser.add_argument('--diffueraser_path', type=str, default="weights/diffuEraser" , help='Path to DiffuEraser')
     parser.add_argument('--propainter_model_dir', type=str, default="weights/propainter" , help='Path to priori model')
+
+    parser.add_argument('--ffmpeg_path', type=str, default="ffmpeg", help='Path to ffmpeg executable')
+    parser.add_argument('--ffprobe_path', type=str, default="ffprobe", help='Path to ffprobe executable')
+    parser.add_argument('--save_mode', type=str, default='lossless_ffv1_rgb',
+                        choices=['lossless_ffv1_rgb', 'lossless_h264_yuv444p', 'lossless_ffv1_yuv444p', 'high_quality_lossy'],
+                        help='Save mode for Propainter output (intermediate file)')
     args = parser.parse_args()
                   
     if not os.path.exists(args.save_path):
@@ -33,7 +39,11 @@ def main():
     # PCM params
     ckpt = "2-Step"
     video_inpainting_sd = DiffuEraser(device, args.base_model_path, args.vae_path, args.diffueraser_path, ckpt=ckpt)
-    propainter = Propainter(args.propainter_model_dir, device=device)
+
+    propainter = Propainter(propainter_model_dir=args.propainter_model_dir, 
+                            device=device, 
+                            ffmpeg_path=args.ffmpeg_path, 
+                            ffprobe_path=args.ffprobe_path)
     
     start_time = time.time()
 

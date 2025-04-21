@@ -740,6 +740,7 @@
     <Compile Include="propainter\utils\file_client.py" />
     <Compile Include="propainter\utils\flow_util.py" />
     <Compile Include="propainter\utils\img_util.py" />
+    <Compile Include="propainter\utils\video_read_write.py" />
     <Compile Include="run_diffueraser.py" />
     <Compile Include="save_checkpoint_stage1.py" />
     <Compile Include="save_checkpoint_stage2.py" />

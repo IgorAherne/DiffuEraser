@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 import os
 import cv2
 import numpy as np
@@ -9,20 +8,13 @@ import torch
 import torchvision
 import gc
 
-try:
-    from model.modules.flow_comp_raft import RAFT_bi
-    from model.recurrent_flow_completion import RecurrentFlowCompleteNet
-    from model.propainter import InpaintGenerator
-    from utils.download_util import load_file_from_url
-    from core.utils import to_tensors
-    from model.misc import get_device
-except:
-    from propainter.model.modules.flow_comp_raft import RAFT_bi
-    from propainter.model.recurrent_flow_completion import RecurrentFlowCompleteNet
-    from propainter.model.propainter import InpaintGenerator
-    from propainter.utils.download_util import load_file_from_url
-    from propainter.core.utils import to_tensors
-    from propainter.model.misc import get_device
+from propainter.model.modules.flow_comp_raft import RAFT_bi
+from propainter.model.recurrent_flow_completion import RecurrentFlowCompleteNet
+from propainter.model.propainter import InpaintGenerator
+from propainter.utils.download_util import load_file_from_url
+from propainter.utils.video_read_write import read_frames_high_fidelity_ffmpeg, write_video_with_ffmpeg
+from propainter.core.utils import to_tensors
+from propainter.model.misc import get_device
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -49,29 +41,6 @@ def resize_frames(frames, size=None):
         if not out_size == process_size:
              frames = [f.resize(process_size, Image.Resampling.LANCZOS) for f in frames] # Use Image.LANCZOS for older PIL
     return frames, process_size, out_size
-
-#  read frames from video
-def read_frame_from_videos(frame_root, video_length):
-    if frame_root.endswith(('mp4', 'mov', 'avi', 'MP4', 'MOV', 'AVI')): # input video path
-        video_name = os.path.basename(frame_root)[:-4]
-        vframes, aframes, info = torchvision.io.read_video(filename=frame_root, pts_unit='sec', end_pts=video_length) # RGB
-        frames = list(vframes.numpy())
-        frames = [Image.fromarray(f) for f in frames]
-        fps = info['video_fps']
-        nframes = len(frames)
-    else:
-        video_name = os.path.basename(frame_root)
-        frames = []
-        fr_lst = sorted(os.listdir(frame_root))
-        for fr in fr_lst:
-            frame = cv2.imread(os.path.join(frame_root, fr))
-            frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            frames.append(frame)
-        fps = None
-        nframes = len(frames)
-    size = frames[0].size
-
-    return frames, fps, size, video_name, nframes
 
 def binary_mask(mask, th=0.1):
     mask[mask>th] = 1
@@ -152,9 +121,11 @@ def get_ref_index(mid_neighbor_id, neighbor_ids, length, ref_stride=10, ref_num=
 
 
 class Propainter:
-    def __init__(
-            self, propainter_model_dir, device):
+    def __init__(self, propainter_model_dir, device,
+                 ffmpeg_path, ffprobe_path):
         self.device = device
+        self.ffmpeg_exe_path = ffmpeg_path
+        self.ffprobe_exe_path = ffprobe_path
         ##############################################
         # set up RAFT and flow competition model
         ##############################################
@@ -179,51 +150,84 @@ class Propainter:
         self.model.eval()
 
 
-    def forward(self, video, mask, output_path, resize_ratio=0.6, video_length=2, height=-1, width=-1,
+
+    def forward(self, video, mask, output_path,
+                save_mode='lossless_ffv1_rgb', # Default to high-fidelity RGB
+                resize_ratio=0.6, video_length=None, height=-1, width=-1,
                 mask_dilation=4, ref_stride=10, neighbor_length=10, subvideo_length=80,
-                raft_iter=20, save_fps=24, save_frames=False, fp16=True):
-        
-        # Use fp16 precision during inference to reduce running memory cost
-        use_half = True if fp16 else False 
+                raft_iter=20, save_fps=None, # Start save_fps as None
+                fp16=True):
+        # --- Keep initial setup ---
+        use_half = True if fp16 else False
         if self.device == torch.device('cpu'):
             use_half = False
 
-        ################ read input video ################ 
-        frames, fps, size, video_name, nframes = read_frame_from_videos(video, video_length)
-        frames = frames[:nframes]
-        if not width == -1 and not height == -1:
-            size = (width, height)
+        ################ read input video ################
+        print("--- Reading Video using Custom FFmpeg Function ---")
+        try:
+            # Call the new reader function
+            frames_pil, fps_read, size_read, color_info, nframes = read_frames_high_fidelity_ffmpeg(
+                video_path=video,
+                max_length=video_length if video_length is not None else 99999.0,
+                ffmpeg_exe_path=self.ffmpeg_exe_path,
+                ffprobe_exe_path=self.ffprobe_exe_path
+            )
+            print("Read Color Info:", color_info)
+            if nframes == 0: # Check if reading actually produced frames
+                 raise ValueError("Video reading resulted in 0 frames.")
+        except (FileNotFoundError, IOError, ValueError) as e:
+             print(f"FATAL ERROR during video reading: {e}")
+             return None # Indicate failure
+        except Exception as e:
+             print(f"Unexpected FATAL ERROR during video reading: {e}")
+             return None
 
+        # --- Use the read values ---
+        frames = frames_pil # Assign the list of PIL images to 'frames'
+        # Determine FPS: use save_fps if provided, otherwise use probed fps
+        final_fps = save_fps if save_fps is not None else fps_read
+        if final_fps is None or final_fps <= 0: # Added check for invalid probed fps
+            print(f"Warning: Invalid FPS determined ({final_fps}). Defaulting to 30.")
+            final_fps = 30.0
+        # Determine initial size: use user override if provided, otherwise use probed size
+        if width != -1 and height != -1:
+            size = (width, height)
+        else:
+            size = size_read # Use the size determined by the reader
+
+        # --- Keep Resizing Logic ---
         longer_edge = max(size[0], size[1])
-        if(longer_edge > MaxSideThresh): 
+        if longer_edge > MaxSideThresh:
             scale = MaxSideThresh / longer_edge
             resize_ratio = resize_ratio * scale
-        if not resize_ratio == 1.0:
-            size = (int(resize_ratio * size[0]), int(resize_ratio * size[1]))
+        if resize_ratio != 1.0: # Apply resizing only if needed
+            print(f"Resizing frames with ratio {resize_ratio:.2f}...")
+            target_size = (int(resize_ratio * size[0]), int(resize_ratio * size[1]))
+            # The resize_frames function correctly returns PIL images
+            frames, process_size, out_size = resize_frames(frames, target_size)
+            print(f"Resized to process size: {process_size}")
+        else:
+            # If no resize needed, ensure process_size and out_size are set
+            frames, process_size, out_size = resize_frames(frames, None) # Let it calc divisible-by-8 size
 
-        frames, size, out_size = resize_frames(frames, size)
-        fps = save_fps if fps is None else fps
+        w, h = process_size # Use the actual processing dimensions
+
 
         ################ read mask ################ 
-        frames_len = len(frames)
-        flow_masks, masks_dilated = read_mask(mask, frames_len, size, 
-                                            flow_mask_dilates=mask_dilation,
-                                            mask_dilates=mask_dilation)
-        flow_masks = flow_masks[:nframes]
-        masks_dilated = masks_dilated[:nframes]
-        w, h = size
+        frames_len = len(frames) # Length after potential resizing
+        # Pass the actual processing size (w, h) to read_mask
+        flow_masks, masks_dilated = read_mask( mask, frames_len, process_size,
+                                               flow_mask_dilates=mask_dilation,
+                                               mask_dilates=mask_dilation )
 
         ################ adjust input ################ 
-        frames_len = min(len(frames), len(masks_dilated))
-        frames = frames[:frames_len]
-        flow_masks = flow_masks[:frames_len]
-        masks_dilated = masks_dilated[:frames_len]
-        
+        # Keep ori_frames_inp based on the *current* list of PIL frames (potentially resized)
         ori_frames_inp = [np.array(f).astype(np.uint8) for f in frames]
-        frames = to_tensors()(frames).unsqueeze(0) * 2 - 1    
+        # Keep tensor conversion logic
+        frames = to_tensors()(frames).unsqueeze(0) * 2 - 1
         flow_masks = to_tensors()(flow_masks).unsqueeze(0)
         masks_dilated = to_tensors()(masks_dilated).unsqueeze(0)
-        frames, flow_masks, masks_dilated = frames.to(self.device), flow_masks.to(self.device), masks_dilated.to(self.device)
+        frames, flow_masks, masks_dilated  =  frames.to(self.device), flow_masks.to(self.device), masks_dilated.to(self.device)
  
         ##############################################
         # ProPainter inference
@@ -497,43 +501,88 @@ class Propainter:
             
             torch.cuda.empty_cache()
 
-        # Use process_size if it differs from out_size and resize is necessary
-        final_output_size = out_size # Default to original target
-        if size != out_size:
-             print(f"Warning: Processing size {size} differs from initial target {out_size}. Adjusting final output or resize.")
-             # Output at processing size (might avoid final resize)
-             final_output_size = size
-             comp_frames_final = comp_frames # No resize needed if already at process_size internally
+        ##############################################
+        # Saving Video
+        ##############################################
+        print(f"--- Saving Video using Custom FFmpeg Function (Mode: {save_mode}) ---")
+        if comp_frames and comp_frames[0] is not None:
+            # Final output size is the processing size (w, h)
+            final_output_size = (w, h)
+            final_frames_to_save = []
+            print("Ensuring final frames are uint8 RGB...")
+            # Use comp_frames from the inference loop
+            for frame_data in tqdm(comp_frames, desc="Preparing Save"):
+                if frame_data.dtype != np.uint8:
+                     # Clip and convert if inference outputted floats
+                     frame_uint8 = np.clip(frame_data, 0, 255).astype(np.uint8)
+                else:
+                     frame_uint8 = frame_data
+                # Ensure it's RGB (it should be from the inference code)
+                if frame_uint8.shape[-1] != 3:
+                     print(f"Warning: Frame data has unexpected shape {frame_uint8.shape}. Skipping.")
+                     continue
+                final_frames_to_save.append(frame_uint8) # Should be HxWxC RGB uint8
 
-        # Choose Option A or B above. Let's assume Option A for simplicity:
-        final_output_size = size
-        comp_frames_final = comp_frames
+            if not final_frames_to_save:
+                 print("Error: No valid frames available after final preparation.")
+                 output_path = None
+            else:
+                 try:
+                     # Call the new write function
+                     write_video_with_ffmpeg(
+                         frames_list=final_frames_to_save,
+                         output_path=output_path,
+                         fps=final_fps, # Use the calculated final FPS
+                         size=final_output_size, # Use the processing size (w, h)
+                         original_video_path=video, # Pass original video for YUV tag probing
+                         ffmpeg_exe_path=self.ffmpeg_exe_path, # Use stored path
+                         ffprobe_exe_path=self.ffprobe_exe_path, # Use stored path
+                         save_mode=save_mode # Pass the mode selected by the user/default
+                     )
+                     print(f"Output video saved to {output_path}")
+                 except Exception as e:
+                     print(f"ERROR during custom video saving: {e}")
+                     output_path = None # Indicate failure
+        else:
+             print("Error: No completed frames generated by inference.")
+             output_path = None
 
-        writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"),
-                                fps, final_output_size) # Use the determined final size
-        for f in range(video_length):
-            # Ensure frame is uint8 before conversion
-            frame_rgb_uint8 = comp_frames_final[f].astype(np.uint8)
-            frame_bgr = cv2.cvtColor(frame_rgb_uint8, cv2.COLOR_RGB2BGR) # CORRECT CONVERSION
-            writer.write(frame_bgr)
-        writer.release()
-        
         torch.cuda.empty_cache()
+        gc.collect() # Add extra garbage collect just in case
 
-        return output_path
+        return output_path # Return the path if successful, None otherwise
 
 
 
 if __name__ == '__main__':
+    # Define paths (or get from argparse if you make this a runnable script)
+    ffmpeg_path  = 'C:/_myDrive/repos/auto-vlog/AutoVlogProj/bin/ffmpeg.exe' # Example path
+    ffprobe_path = 'C:/_myDrive/repos/auto-vlog/AutoVlogProj/bin/ffprobe.exe'# Example path
+
+    propainter_model_dir = "weights/propainter"
+    video_path = "examples/example1/video.mp4"
+    mask_path =  "examples/example1/mask.mp4"
+
+    output_path = "results/inpainted.mp4" # Example output path
+
+    # Ensure results directory exists
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     device = get_device()
-    propainter_model_dir = "weights/propainter"
-    propainter = Propainter(propainter_model_dir, device=device)
 
-    video = "examples/example1/video.mp4"
-    mask =  "examples/example1/mask.mp4"
-    output = "results/priori.mp4"
-    res = propainter.forward(video, mask, output)
-    
+    # *** Pass the paths during instantiation ***
+    propainter = Propainter(propainter_model_dir,
+                            device=device,
+                            ffmpeg_path=ffmpeg_path,  # Pass the path
+                            ffprobe_path=ffprobe_path) # Pass the path
 
-    
+    print(f"Running ProPainter on {video_path}...")
+    # *** Specify the desired save_mode in the forward call ***
+    res = propainter.forward(video_path,
+                             mask_path,
+                             output_path,
+                             save_mode='lossless_ffv1_rgb') # Or another mode
+    if res:
+        print(f"Processing complete. Output saved to: {res}")
+    else:
+        print("Processing failed.")
