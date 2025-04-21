@@ -14,8 +14,13 @@ DEFAULT_COLOR_SPACE = 'bt709'
 DEFAULT_COLOR_PRIMARIES = 'bt709'
 DEFAULT_COLOR_TRC = 'bt709'
 
-def write_video_with_ffmpeg(self,
-                           frames_list,
+# standard characteristics for RGB output (sRGB assumption)
+RGB_OUT_RANGE = 'pc'
+RGB_OUT_SPACE = 'bt709' # sRGB uses BT.709 coefficients for conversion context
+RGB_OUT_PRIMARIES = 'bt709' # sRGB primaries match BT.709
+RGB_OUT_TRC = 'bt709' # sRGB transfer function is similar to BT.709 (or use 'iec61966-2-1')
+
+def write_video_with_ffmpeg(frames_list,
                            output_path,
                            fps,
                            size, # Expected as (width, height) tuple

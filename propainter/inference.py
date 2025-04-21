@@ -176,10 +176,10 @@ class Propainter:
             if nframes == 0: # Check if reading actually produced frames
                  raise ValueError("Video reading resulted in 0 frames.")
         except (FileNotFoundError, IOError, ValueError) as e:
-             print(f"FATAL ERROR during video reading: {e}")
-             return None # Indicate failure
+            print(f"\n\nFATAL ERROR during video reading: {e}\n")
+            return None # Indicate failure
         except Exception as e:
-             print(f"Unexpected FATAL ERROR during video reading: {e}")
+             print(f"\n\nUnexpected FATAL ERROR during video reading: {e}\n")
              return None
 
         # --- Use the read values ---

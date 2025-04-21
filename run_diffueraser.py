@@ -22,8 +22,8 @@ def main():
     parser.add_argument('--diffueraser_path', type=str, default="weights/diffuEraser" , help='Path to DiffuEraser')
     parser.add_argument('--propainter_model_dir', type=str, default="weights/propainter" , help='Path to priori model')
 
-    parser.add_argument('--ffmpeg_path', type=str, default="ffmpeg", help='Path to ffmpeg executable')
-    parser.add_argument('--ffprobe_path', type=str, default="ffprobe", help='Path to ffprobe executable')
+    parser.add_argument('--ffmpeg_path', type=str, default="C:/_myDrive/repos/auto-vlog/AutoVlogProj/bin/ffmpeg.exe", help='Path to ffmpeg executable')
+    parser.add_argument('--ffprobe_path', type=str, default="C:/_myDrive/repos/auto-vlog/AutoVlogProj/bin/ffprobe.exe", help='Path to ffprobe executable')
     parser.add_argument('--save_mode', type=str, default='lossless_ffv1_rgb',
                         choices=['lossless_ffv1_rgb', 'lossless_h264_yuv444p', 'lossless_ffv1_yuv444p', 'high_quality_lossy'],
                         help='Save mode for Propainter output (intermediate file)')
