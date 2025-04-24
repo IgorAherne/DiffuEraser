@@ -20,23 +20,27 @@ RGB_OUT_SPACE = 'bt709' # sRGB uses BT.709 coefficients for conversion context
 RGB_OUT_PRIMARIES = 'bt709' # sRGB primaries match BT.709
 RGB_OUT_TRC = 'bt709' # sRGB transfer function is similar to BT.709 (or use 'iec61966-2-1')
 
+
 def write_video_with_ffmpeg(frames_list,
                            output_path,
                            fps,
                            size, # Expected as (width, height) tuple
+                           audio_path=None, # <<< ADDED audio_path parameter >>>
                            original_video_path=None, # Optional: For probing target YUV tags
                            ffmpeg_exe_path='ffmpeg',
                            ffprobe_exe_path='ffprobe',
-                           # Renamed quality_mode to be more descriptive
                            save_mode='lossless_ffv1_rgb'): # Options below
     """
     Saves a list of NumPy RGB uint8 frames to a video file using FFmpeg,
-    prioritizing lossless quality for intermediate editing.
+    optionally muxing in an audio stream. Prioritizes lossless quality for
+    intermediate editing.
     Args:
         frames_list: List of NumPy arrays (uint8, RGB, HxWxC).
         output_path: Path to save the output video.
         fps: Frames per second for the output video.
         size: Tuple of (width, height) for the output video.
+        audio_path (Optional[str]): Path to the audio file to mux into the video.
+                                     If None, no audio is added.
         original_video_path: Path to the original video to probe for setting
                                 output tags when saving to a YUV format. Ignored
                                 if save_mode targets RGB output.
@@ -67,7 +71,14 @@ def write_video_with_ffmpeg(frames_list,
             print(f"Warning: Provided size {size} differs from frame dimensions {(width, height)}. Using frame dimensions.")
             size = (width, height) # Use actual frame dimensions
 
+    # Validate audio path if provided
+    if audio_path and not Path(audio_path).is_file():
+        print(f"Warning: Provided audio_path '{audio_path}' not found. Video will be saved without audio.")
+        audio_path = None # Treat as if no audio was provided
+
     print(f"Saving video with mode: '{save_mode}'")
+    if audio_path:
+        print(f"Muxing audio from: {audio_path}")
 
     # --- 1. Probe Original Video (Only needed for YUV output modes) ---
     target_range = DEFAULT_COLOR_RANGE
@@ -113,20 +124,37 @@ def write_video_with_ffmpeg(frames_list,
 
     # --- 2. Construct FFmpeg Command based on save_mode ---
 
-    # Input settings (common to all modes)
+    # Input settings
     command_input = [
         ffmpeg_exe_path, '-y',
         '-f', 'rawvideo', '-vcodec', 'rawvideo', '-s', f'{size[0]}x{size[1]}',
         '-pix_fmt', 'rgb24', # Input from pipe is uint8 RGB
         '-r', str(fps),
-        '-i', '-', # Read from stdin
+        '-i', '-', # Read video frames from stdin (Input 0)
     ]
+    # <<< ADD Audio Input if path provided >>>
+    if audio_path:
+        command_input.extend(['-i', str(audio_path)]) # Add audio file as Input 1
 
     command_filters = []     # Filters like scale
     command_output_tags = [] # Output format/color tags
     command_codec_quality = [] # Codec and quality settings
+    command_mapping = []     # Stream mapping
 
-    # --- Configure based on save_mode ---
+    # <<< DETERMINE Stream Mapping >>>
+    command_mapping.append('-map')
+    command_mapping.append('0:v:0') # Map video from Input 0
+    if audio_path:
+        command_mapping.append('-map')
+        command_mapping.append('1:a:0') # Map audio from Input 1
+        # Copy audio codec by default for speed and quality
+        command_codec_quality.extend(['-c:a', 'copy'])
+    else:
+        # Explicitly disable audio if none provided
+        command_codec_quality.extend(['-an'])
+
+
+    # --- Configure based on save_mode (VIDEO settings) ---
     if save_mode == 'lossless_ffv1_rgb':
         print("Configuring for Lossless FFV1 (RGB)...")
         codec = 'ffv1'
@@ -141,7 +169,8 @@ def write_video_with_ffmpeg(frames_list,
             '-color_primaries', RGB_OUT_PRIMARIES,
             '-color_trc', RGB_OUT_TRC,
         ]
-        command_codec_quality = ['-c:v', codec] # FFV1 is inherently lossless
+        # Add video codec settings
+        command_codec_quality.extend(['-c:v', codec]) # FFV1 is inherently lossless
 
     elif save_mode == 'lossless_h264_yuv444p':
         print("Configuring for Lossless H.264 (YUV444p)...")
@@ -160,7 +189,7 @@ def write_video_with_ffmpeg(frames_list,
             '-color_trc', target_trc,
         ]
         # Use -qp 0 for H.264 lossless, ultrafast preset is fine
-        command_codec_quality = ['-c:v', codec, '-preset', 'ultrafast', '-qp', '0']
+        command_codec_quality.extend(['-c:v', codec, '-preset', 'ultrafast', '-qp', '0'])
 
     elif save_mode == 'lossless_ffv1_yuv444p':
         print("Configuring for Lossless FFV1 (YUV444p)...")
@@ -178,7 +207,8 @@ def write_video_with_ffmpeg(frames_list,
             '-color_primaries', target_primaries,
             '-color_trc', target_trc,
         ]
-        command_codec_quality = ['-c:v', codec] # FFV1 is inherently lossless
+        # Add video codec settings
+        command_codec_quality.extend(['-c:v', codec]) # FFV1 is inherently lossless
 
     elif save_mode == 'high_quality_lossy':
         print("Configuring for High Quality Lossy H.264 (YUV420p)...")
@@ -197,7 +227,7 @@ def write_video_with_ffmpeg(frames_list,
             '-color_trc', target_trc,
         ]
         # High quality lossy settings
-        command_codec_quality = ['-c:v', codec, '-preset', 'slow', '-crf', '17']
+        command_codec_quality.extend(['-c:v', codec, '-preset', 'slow', '-crf', '17'])
 
     else:
         raise ValueError(f"Unsupported save_mode: '{save_mode}'. Valid modes: "
@@ -205,17 +235,21 @@ def write_video_with_ffmpeg(frames_list,
                             "'lossless_ffv1_yuv444p', 'high_quality_lossy'")
 
     # --- Final Command Assembly ---
-    command = (command_input + command_filters + command_output_tags +
-                command_codec_quality + ['-r', str(fps), str(output_path)])
+    # Order: Input(s) -> Filters -> Mapping -> Codec/Quality -> Output Tags -> Output File
+    command = (command_input + command_filters + command_mapping +
+               command_codec_quality + command_output_tags +
+               # Ensure output frame rate is set correctly
+               ['-r', str(fps), str(output_path)])
 
     print("\n--- Running FFmpeg Save Command ---")
     # Print command safely for debugging
     printable_command = []
     for item in command:
-        if os.path.sep in item and Path(item).name in item:
-            printable_command.append(repr(item))
+        # Heuristic to quote paths containing spaces or special characters
+        if any(c in item for c in [' ', '\\', '/']) and Path(item).name in item:
+             printable_command.append(f'"{item}"') # Basic quoting
         else:
-            printable_command.append(item)
+             printable_command.append(item)
     print(" ".join(printable_command))
     print("-----------------------------------\n")
 
@@ -239,12 +273,24 @@ def write_video_with_ffmpeg(frames_list,
                         frame = frame.astype(np.uint8)
                     # Directly get bytes - no further conversion needed here
                     frame_bytes = frame.tobytes()
-                    process.stdin.write(frame_bytes)
+                    if process.stdin: # Check if stdin is still valid
+                         process.stdin.write(frame_bytes)
+                    else:
+                         print("\nError: FFmpeg stdin pipe is closed. Stopping writer.")
+                         break
                     pbar.update(1)
                 except BrokenPipeError:
                         print("\nError: FFmpeg pipe broke (likely process terminated). Stopping writer thread.")
                         # Can't write anymore
                         break
+                except ValueError as ve: # Specifically catch ValueError if stdin closed
+                        if "write to closed file" in str(ve).lower():
+                            print("\nError: Attempted write to closed FFmpeg stdin pipe. Stopping writer.")
+                            break
+                        else:
+                             print(f"\nValueError writing frame to FFmpeg pipe: {ve}")
+                             writer_exception = ve
+                             break
                 except Exception as e:
                     print(f"\nError writing frame to FFmpeg pipe: {e}")
                     # Raise or store the exception
@@ -344,6 +390,7 @@ def write_video_with_ffmpeg(frames_list,
         # Final cleanup check
         if process and process.poll() is None:
                 print("Warning: FFmpeg process may still be running after function exit.")
+
 # --- End of save_video_with_ffmpeg method ---
 
 
