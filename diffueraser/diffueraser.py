@@ -207,7 +207,7 @@ class DiffuEraser:
                 max_img_size = 1280, max_video_length=10, mask_dilation_iter=4,
                 nframes=22, # Keep this default or set slightly lower (e.g., 16, 18) if needed
                 seed=None, revision = None, guidance_scale=None, blended=True):
-        validation_prompt = "DARK BLACK HOLE CUBE" #MODIF
+        validation_prompt = "" 
         guidance_scale_final = self.guidance_scale if guidance_scale is None else guidance_scale
 
         if (max_img_size<256 or max_img_size>1920): # Increased upper limit slightly based on code analysis
