@@ -20,6 +20,14 @@ RGB_OUT_SPACE = 'bt709' # sRGB uses BT.709 coefficients for conversion context
 RGB_OUT_PRIMARIES = 'bt709' # sRGB primaries match BT.709
 RGB_OUT_TRC = 'bt709' # sRGB transfer function is similar to BT.709 (or use 'iec61966-2-1')
 
+# Calculate the project root by going up 3 levels (utils -> propainter -> DiffuEraser)
+# Define executable paths relative to the project root
+# Use str() to ensure compatibility if subprocess needs string paths
+_current_script_path = Path(__file__).resolve()
+_project_root = _current_script_path.parent.parent.parent
+ffmpeg_exe_path = str(_project_root / "bin" / "ffmpeg.exe")
+ffprobe_exe_path = str(_project_root / "bin" / "ffprobe.exe")
+
 
 def write_video_with_ffmpeg(frames_list,
                            output_path,
@@ -27,8 +35,6 @@ def write_video_with_ffmpeg(frames_list,
                            size, # Expected as (width, height) tuple
                            audio_path=None, # <<< ADDED audio_path parameter >>>
                            original_video_path=None, # Optional: For probing target YUV tags
-                           ffmpeg_exe_path='ffmpeg',
-                           ffprobe_exe_path='ffprobe',
                            save_mode='lossless_ffv1_rgb'): # Options below
     """
     Saves a list of NumPy RGB uint8 frames to a video file using FFmpeg,
@@ -44,8 +50,6 @@ def write_video_with_ffmpeg(frames_list,
         original_video_path: Path to the original video to probe for setting
                                 output tags when saving to a YUV format. Ignored
                                 if save_mode targets RGB output.
-        ffmpeg_exe_path: Path or name of the ffmpeg executable.
-        ffprobe_exe_path: Path or name of the ffprobe executable.
         save_mode (str): Defines the codec and color format. Options:
             'lossless_ffv1_rgb': (Recommended Highest Fidelity) Saves as RGB using FFV1.
                                     No color space conversion during save.
@@ -397,9 +401,7 @@ def write_video_with_ffmpeg(frames_list,
 
 def read_frames_high_fidelity_ffmpeg(
     video_path,
-    max_length=99999.0,
-    ffmpeg_exe_path='ffmpeg',
-    ffprobe_exe_path='ffprobe'):
+    max_length=99999.0):
     """
     Reads video frames using FFmpeg subprocess pipe, aiming for high fidelity
     by using a 16-bit RGB intermediate and explicit color tagging.
@@ -407,8 +409,6 @@ def read_frames_high_fidelity_ffmpeg(
     Args:
         video_path: Path to the input video file.
         max_length: Maximum duration to read in seconds. Defaults to very large.
-        ffmpeg_exe_path: Path or name of the ffmpeg executable.
-        ffprobe_exe_path: Path or name of the ffprobe executable.
     Returns:
         tuple: (frames_pil, fps, size, color_info, n_frames_read)
                frames_pil: List of PIL Image objects (RGB, uint8).

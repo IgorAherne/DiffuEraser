@@ -119,13 +119,9 @@ def read_mask(validation_mask, fps, n_total_frames, img_size, mask_dilation_iter
 class DiffuEraser:
     def __init__(
             self, device, base_model_path, vae_path, diffueraser_path, 
-            ffmpeg_path="ffmpeg",
-            ffprobe_path="ffprobe",
             revision=None,
             ckpt="Normal CFG 4-Step", mode="sd15", loaded=None):
         self.device = device
-        self.ffmpeg_path = ffmpeg_path
-        self.ffprobe_path = ffprobe_path
         ## load model
         self.vae = AutoencoderKL.from_pretrained(vae_path)
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -219,8 +215,6 @@ class DiffuEraser:
             frames_pil, fps, img_size, color_info, n_total_frames = read_frames_high_fidelity_ffmpeg(
                 video_path=validation_image,
                 max_length=max_video_length if max_video_length > 0 else 99999.0,
-                ffmpeg_exe_path=self.ffmpeg_path, # Use stored path
-                ffprobe_exe_path=self.ffprobe_path # Use stored path
             )
             if not frames_pil: raise ValueError("FFmpeg reader returned no frames.")
             frames = frames_pil # Assign to the variable name used later
@@ -242,8 +236,6 @@ class DiffuEraser:
                 mask_frames_pil, mask_fps, mask_size, _, mask_frames_read = read_frames_high_fidelity_ffmpeg(
                     video_path=validation_mask,
                     max_length=max_video_length if max_video_length > 0 else 99999.0,
-                    ffmpeg_exe_path=self.ffmpeg_path,
-                    ffprobe_exe_path=self.ffprobe_path
                 )
                 if not mask_frames_pil: raise ValueError("FFmpeg mask reader returned no frames.")
                 # Optional: Check consistency
@@ -313,8 +305,6 @@ class DiffuEraser:
             priori_frames_pil, priori_fps, priori_size, _, priori_frames_read = read_frames_high_fidelity_ffmpeg(
                 video_path=priori,
                 max_length=0, # Read full priori video
-                ffmpeg_exe_path=self.ffmpeg_path,
-                ffprobe_exe_path=self.ffprobe_path
             )
             if not priori_frames_pil: raise ValueError("FFmpeg priori reader returned no frames.")
             prioris = priori_frames_pil # Assign to variable name used later
@@ -554,8 +544,6 @@ class DiffuEraser:
                 fps=fps,
                 size=frames_np_list[0].shape[1::-1], # Get (width, height) from np array
                 original_video_path=validation_image, # Pass original crop for YUV tag probing if using YUV save_mode
-                ffmpeg_exe_path=self.ffmpeg_path, # Use stored path
-                ffprobe_exe_path=self.ffprobe_path, # Use stored path
                 save_mode=save_mode
             )
             print(f"--- Video writing complete (Mode: {save_mode}) ---")

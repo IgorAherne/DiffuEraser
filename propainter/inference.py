@@ -121,11 +121,8 @@ def get_ref_index(mid_neighbor_id, neighbor_ids, length, ref_stride=10, ref_num=
 
 
 class Propainter:
-    def __init__(self, propainter_model_dir, device,
-                 ffmpeg_path, ffprobe_path):
+    def __init__(self, propainter_model_dir, device):
         self.device = device
-        self.ffmpeg_exe_path = ffmpeg_path
-        self.ffprobe_exe_path = ffprobe_path
         ##############################################
         # set up RAFT and flow competition model
         ##############################################
@@ -169,8 +166,6 @@ class Propainter:
             frames_pil, fps_read, size_read, color_info, nframes = read_frames_high_fidelity_ffmpeg(
                 video_path=video,
                 max_length=video_length if video_length is not None else 99999.0,
-                ffmpeg_exe_path=self.ffmpeg_exe_path,
-                ffprobe_exe_path=self.ffprobe_exe_path
             )
             print("Read Color Info:", color_info)
             if nframes == 0: # Check if reading actually produced frames
@@ -535,8 +530,6 @@ class Propainter:
                          fps=final_fps, # Use the calculated final FPS
                          size=final_output_size, # Use the processing size (w, h)
                          original_video_path=video, # Pass original video for YUV tag probing
-                         ffmpeg_exe_path=self.ffmpeg_exe_path, # Use stored path
-                         ffprobe_exe_path=self.ffprobe_exe_path, # Use stored path
                          save_mode=save_mode # Pass the mode selected by the user/default
                      )
                      print(f"Output video saved to {output_path}")
@@ -555,10 +548,6 @@ class Propainter:
 
 
 if __name__ == '__main__':
-    # Define paths (or get from argparse if you make this a runnable script)
-    ffmpeg_path  = 'C:/_myDrive/repos/auto-vlog/AutoVlogProj/bin/ffmpeg.exe' # Example path
-    ffprobe_path = 'C:/_myDrive/repos/auto-vlog/AutoVlogProj/bin/ffprobe.exe'# Example path
-
     propainter_model_dir = "weights/propainter"
     video_path = "examples/example1/video.mp4"
     mask_path =  "examples/example1/mask.mp4"
@@ -571,10 +560,7 @@ if __name__ == '__main__':
     device = get_device()
 
     # *** Pass the paths during instantiation ***
-    propainter = Propainter(propainter_model_dir,
-                            device=device,
-                            ffmpeg_path=ffmpeg_path,  # Pass the path
-                            ffprobe_path=ffprobe_path) # Pass the path
+    propainter = Propainter(propainter_model_dir, device=device) 
 
     print(f"Running ProPainter on {video_path}...")
     # *** Specify the desired save_mode in the forward call ***
