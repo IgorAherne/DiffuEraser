@@ -263,6 +263,20 @@ def write_video_with_ffmpeg(frames_list,
     process = None
     writer_exception = None # To capture exceptions from the writer thread
 
+    # --- New: Storage and reader threads for handling stdout/stderr to prevent deadlocks ---
+    stdout_lines = []
+    stderr_lines = []
+
+    def _reader(pipe, storage_list, pipe_name):
+        """Reads binary lines from a pipe, decodes, and stores them."""
+        try:
+            with pipe:
+                for line in iter(pipe.readline, b''):
+                    decoded_line = line.decode('utf-8', errors='replace').strip()
+                    storage_list.append(decoded_line)
+        except Exception as e:
+            print(f"Warning: Exception in reader thread for {pipe_name}: {e}")
+
     def _write_frame(process, q, pbar):
         nonlocal writer_exception
         try:
@@ -309,7 +323,17 @@ def write_video_with_ffmpeg(frames_list,
 
     # --- Start FFmpeg Process and Writer Thread ---
     try:
+        # Note: We are not using text=True, so pipes are binary
         process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        # Start reader threads to prevent pipe buffers from filling up:
+        stdout_reader_thread = threading.Thread(target=_reader, args=(process.stdout, stdout_lines, "stdout"), name="ffmpeg_stdout_reader")
+        stderr_reader_thread = threading.Thread(target=_reader, args=(process.stderr, stderr_lines, "stderr"), name="ffmpeg_stderr_reader")
+        stdout_reader_thread.daemon = True
+        stderr_reader_thread.daemon = True
+        stdout_reader_thread.start()
+        stderr_reader_thread.start()
+
         pbar_desc = f"Encoding ({save_mode})"
         pbar = tqdm(total=len(frames_list), desc=pbar_desc, unit="frame")
         writer_thread = threading.Thread(target=_write_frame, args=(process, q, pbar), name="ffmpeg_writer")
@@ -353,16 +377,22 @@ def write_video_with_ffmpeg(frames_list,
 
         # Wait for FFmpeg process to finish and get output
         try:
-                stdout, stderr = process.communicate(timeout=600) # 10 min timeout for potentially slow lossless encodes
+                # We no longer use communicate(), as our reader threads are handling the pipes.
+                # We just wait for the process to terminate.
+                process.wait(timeout=600) # 10 min timeout for potentially slow lossless encodes
                 return_code = process.returncode
         except subprocess.TimeoutExpired:
                 print("\nError: FFmpeg process timed out after closing input.")
                 if process.poll() is None: process.terminate() # Attempt termination
                 raise TimeoutError(f"FFmpeg save process timed out.") from None
 
+        # --- New: Wait for reader threads to finish draining pipes completely ---
+        stdout_reader_thread.join(timeout=10)
+        stderr_reader_thread.join(timeout=10)
+
         # --- Check final return code and report ---
         if return_code != 0:
-            stderr_str = stderr.decode('utf-8', errors='replace').strip()
+            stderr_str = "\n".join(stderr_lines).strip()
             print(f"\n--- FFmpeg Save Error (Return Code: {return_code}) ---")
             if stderr_str: print(f"Stderr:\n{stderr_str}")
             else: print("Stderr: <Empty>")
@@ -371,7 +401,7 @@ def write_video_with_ffmpeg(frames_list,
         else:
             print(f"Video successfully saved to: {output_path}")
             # Optional: Log non-empty stdout on success for info
-            stdout_str = stdout.decode('utf-8', errors='replace').strip()
+            stdout_str = "\n".join(stdout_lines).strip()
             if stdout_str: print(f"\nFFmpeg stdout:\n{stdout_str}")
 
     except FileNotFoundError:
