@@ -151,8 +151,6 @@ def write_video_with_ffmpeg(frames_list,
     if audio_path:
         command_mapping.append('-map')
         command_mapping.append('1:a:0') # Map audio from Input 1
-        # Copy audio codec by default for speed and quality
-        command_codec_quality.extend(['-c:a', 'copy'])
     else:
         # Explicitly disable audio if none provided
         command_codec_quality.extend(['-an'])
