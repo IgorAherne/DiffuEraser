@@ -231,7 +231,9 @@ def write_video_with_ffmpeg(frames_list,
             '-color_trc', target_trc,
         ]
         # High quality lossy settings
-        command_codec_quality.extend(['-c:v', codec, '-preset', 'slow', '-crf', '17'])
+        # -g: max 3s between keyframes for reliable player seeking (x264 default of 250 is too sparse)
+        command_codec_quality.extend(['-c:v', codec, '-preset', 'slow', '-crf', '17',
+                                      '-g', str(int(fps * 3))])
 
     else:
         raise ValueError(f"Unsupported save_mode: '{save_mode}'. Valid modes: "
@@ -243,7 +245,9 @@ def write_video_with_ffmpeg(frames_list,
     command = (command_input + command_filters + command_mapping +
                command_codec_quality + command_output_tags +
                # Ensure output frame rate is set correctly
-               ['-r', str(fps), str(output_path)])
+               ['-r', str(fps),
+                '-movflags', '+faststart',
+                str(output_path)])
 
     print("\n--- Running FFmpeg Save Command ---")
     # Print command safely for debugging
