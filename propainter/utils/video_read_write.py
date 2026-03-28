@@ -232,8 +232,11 @@ def write_video_with_ffmpeg(frames_list,
         ]
         # High quality lossy settings
         # -g: max 3s between keyframes for reliable player seeking (x264 default of 250 is too sparse)
+        # bframes=0: prevent B-frame reordering and MP4 edit lists, which cause
+        # frame-index offsets between decoders (e.g. decord vs ffmpeg).
         command_codec_quality.extend(['-c:v', codec, '-preset', 'slow', '-crf', '17',
-                                      '-g', str(int(fps * 3))])
+                                      '-g', str(int(fps * 3)),
+                                      '-x264-params', 'bframes=0'])
 
     else:
         raise ValueError(f"Unsupported save_mode: '{save_mode}'. Valid modes: "
