@@ -28,6 +28,10 @@ _project_root = _current_script_path.parent.parent.parent
 ffmpeg_exe_path = str(_project_root / "bin" / "ffmpeg.exe")
 ffprobe_exe_path = str(_project_root / "bin" / "ffprobe.exe")
 
+# bframes=0 prevents B-frame reordering and MP4 edit lists, which cause
+# frame-index mismatches between decoders (decord, media players vs ffmpeg).
+X264_NO_BFRAMES = ('-x264-params', 'bframes=0')
+
 
 def write_video_with_ffmpeg(frames_list,
                            output_path,
@@ -236,7 +240,7 @@ def write_video_with_ffmpeg(frames_list,
         # frame-index offsets between decoders (e.g. decord vs ffmpeg).
         command_codec_quality.extend(['-c:v', codec, '-preset', 'slow', '-crf', '17',
                                       '-g', str(int(fps * 3)),
-                                      '-x264-params', 'bframes=0'])
+                                      *X264_NO_BFRAMES])
 
     else:
         raise ValueError(f"Unsupported save_mode: '{save_mode}'. Valid modes: "
@@ -578,6 +582,16 @@ def read_frames_high_fidelity_ffmpeg(
     try:
         # FileNotFoundError will be raised here if ffmpeg_exe_path is invalid
         process = subprocess.Popen(read_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # Drain stderr in a background thread to prevent pipe deadlock.
+        # On Windows the stderr pipe buffer is ~64KB — if ffmpeg fills it,
+        # ffmpeg blocks on write, which blocks stdout, which blocks our read loop.
+        stderr_chunks = []
+        stderr_thread = threading.Thread(
+            target=lambda: stderr_chunks.append(process.stderr.read()),
+            daemon=True
+        )
+        stderr_thread.start()
+
         frame_count = 0
         while True:
             in_bytes = process.stdout.read(bytes_per_frame)
@@ -591,8 +605,9 @@ def read_frames_high_fidelity_ffmpeg(
             frames_pil.append(Image.fromarray(frame_np_uint8))
             frame_count += 1
 
-        stdout, stderr = process.communicate(timeout=120)
-        return_code = process.returncode
+        stderr_thread.join(timeout=120)
+        return_code = process.wait(timeout=120)
+        stderr = stderr_chunks[0] if stderr_chunks else b''
 
         if return_code != 0:
             stderr_str = stderr.decode('utf-8', errors='replace').strip()
