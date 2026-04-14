@@ -1,6 +1,5 @@
 
 import gc
-import copy
 import cv2
 import os
 import numpy as np
@@ -209,118 +208,13 @@ class DiffuEraser:
         if (max_img_size<256 or max_img_size>1920): # Increased upper limit slightly based on code analysis
             raise ValueError("The max_img_size must be between 256 and 1920.")
 
-        ############### read input video ################
-        print(f"--- Reading video: {validation_image} using FFmpeg ---")
-        try:
-            frames_pil, fps, img_size, color_info, n_total_frames = read_frames_high_fidelity_ffmpeg(
-                video_path=validation_image,
-                max_length=max_video_length if max_video_length > 0 else 99999.0,
-            )
-            if not frames_pil: raise ValueError("FFmpeg reader returned no frames.")
-            frames = frames_pil # Assign to the variable name used later
-        except Exception as e:
-             print(f"FATAL ERROR reading video with FFmpeg: {e}")
-             raise # Re-raise the error to stop execution
-        video_len = len(frames) # video_len is now n_total_frames directly
-        print(f"--- Video read: {video_len} frames, FPS: {fps}, Size: {img_size} ---")
-
-        ################     read mask    ################
-        print(f"--- Reading mask: {validation_mask} ---")
-        mask_frames_pil = []
-        # Determine if mask is a video or image
-        mask_is_video = validation_mask.lower().endswith(('.mp4', '.mov', '.avi'))
-
-        if mask_is_video:
-            print("--- Mask is video, reading with FFmpeg ---")
-            try:
-                mask_frames_pil, mask_fps, mask_size, _, mask_frames_read = read_frames_high_fidelity_ffmpeg(
-                    video_path=validation_mask,
-                    max_length=max_video_length if max_video_length > 0 else 99999.0,
-                )
-                if not mask_frames_pil: raise ValueError("FFmpeg mask reader returned no frames.")
-                # Optional: Check consistency
-                if abs(mask_fps - fps) > 0.1: print(f"Warning: Mask FPS {mask_fps} differs significantly from video FPS {fps}.")
-                if mask_size != img_size: print(f"Warning: Mask size {mask_size} differs from video size {img_size}. Resizing mask.")
-                if mask_frames_read < video_len: print(f"Warning: Mask video has fewer frames ({mask_frames_read}) than video ({video_len}).")
-                # Trim or pad mask_frames_pil if necessary to match video_len (simplest: trim)
-                mask_frames_pil = mask_frames_pil[:video_len]
-
-            except Exception as e:
-                 print(f"FATAL ERROR reading mask video with FFmpeg: {e}")
-                 raise
-        else:
-            print("--- Mask is image, reading with PIL ---")
-            try:
-                # Read single image mask
-                mask_img = Image.open(validation_mask)
-                # Repeat the single mask for all video frames
-                mask_frames_pil = [mask_img] * video_len
-            except Exception as e:
-                 print(f"FATAL ERROR reading mask image: {e}")
-                 raise
-        # Process mask frames (dilation, create masked images)
-        print(f"--- Processing {len(mask_frames_pil)} mask frames (dilation, creating masked images) ---")
-        validation_masks_input = [] # Will store dilated PIL masks
-        validation_images_input = [] # Will store masked PIL images
-        for i in range(video_len): # Iterate up to the actual video length
-            if i >= len(mask_frames_pil):
-                print(f"Warning: Ran out of mask frames at index {i}. Using last available mask.")
-                mask_pil = mask_frames_pil[-1] # Reuse last mask
-            else:
-                mask_pil = mask_frames_pil[i]
-
-            # Resize mask to match video frame size (use LANCZOS for consistency if possible, else NEAREST)
-            if mask_pil.size != img_size:
-                # Use LANCZOS if high quality is needed, NEAREST if strict binary mask preferred
-                mask_pil = mask_pil.resize(img_size, Image.Resampling.NEAREST)
-
-            # Convert to grayscale and NumPy
-            mask_np = np.array(mask_pil.convert('L'))
-
-            # Perform dilation (using cv2 like original `read_mask` for consistency)
-            m = np.array(mask_np > 0).astype(np.uint8) # Binarize
-            
-            # --- Dilation step ---
-            if mask_dilation_iter > 0:
-                m = cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=mask_dilation_iter)
-
-            # Store dilated mask as PIL Image
-            dilated_mask_pil = Image.fromarray(m * 255)
-            validation_masks_input.append(dilated_mask_pil)
-
-            # Create masked image (using the correctly read `frames`)
-            frame_np = np.array(frames[i]) # Get the corresponding video frame
-            mask_for_apply = np.expand_dims(m, axis=2) # Shape (H, W, 1), values 0 or 1
-            masked_image_np = frame_np * (1 - mask_for_apply) # Apply mask (0 keeps original, 1 makes black)
-            masked_image_pil = Image.fromarray(masked_image_np.astype(np.uint8))
-            validation_images_input.append(masked_image_pil)
-
-        del mask_frames_pil # Free memory
-        gc.collect()
-        print(f"--- Mask processing complete: {len(validation_masks_input)} masks, {len(validation_images_input)} masked images ---")
+        ############### read input video + masks ################
+        frames, validation_masks_input, validation_images_input, fps, img_size, video_len = \
+            self._read_video_and_process_masks(
+                validation_image, validation_mask, max_video_length, mask_dilation_iter)
 
         ################    read priori   ################
-        print(f"--- Reading priori: {priori} using FFmpeg ---")
-        try:
-            priori_frames_pil, priori_fps, priori_size, _, priori_frames_read = read_frames_high_fidelity_ffmpeg(
-                video_path=priori,
-                max_length=0, # Read full priori video
-            )
-            if not priori_frames_pil: raise ValueError("FFmpeg priori reader returned no frames.")
-            prioris = priori_frames_pil # Assign to variable name used later
-
-            # Optional: Consistency checks
-            if abs(priori_fps - fps) > 0.1: print(f"Warning: Priori FPS {priori_fps} differs from video FPS {fps}.")
-            if priori_size != img_size: print(f"Warning: Priori size {priori_size} differs from video size {img_size}. Priori frames will be used as is.")
-            if priori_frames_read != video_len: print(f"Warning: Priori frames read ({priori_frames_read}) differs from video length ({video_len}). Using {priori_frames_read} frames.")
-            # Update video_len based on shortest input
-            video_len = min(video_len, priori_frames_read) # Adjust length based on actual priori frames
-        except Exception as e:
-            print(f"FATAL ERROR reading priori video with FFmpeg: {e}")
-            raise
-
-        os.remove(priori) # Keep removal of the intermediate file
-        print(f"--- Priori read: {len(prioris)} frames ---")
+        prioris, video_len = self._read_priori(priori, fps, img_size, video_len)
 
         ## recheck frame counts and trim lists to the minimum common length
         # This block might need adjustment based on the new video_len update above
@@ -355,12 +249,13 @@ class DiffuEraser:
              resized_frames = resize_frames(frames, img_size)
         else:
              resized_frames = frames # No resize needed if size matches
-        # Create deep copies *after* potential resizing for final composition
-        resized_frames_ori = copy.deepcopy(resized_frames)
-        validation_masks_input_ori = copy.deepcopy(validation_masks_input)
+        # Shallow copies for final composition — pipeline converts PIL images to
+        # tensors internally without mutating the originals.
+        resized_frames_ori = list(resized_frames)
+        validation_masks_input_ori = list(validation_masks_input)
         print(f"--- Final processing dimensions confirmed: {resized_frames_ori[0].size} ---")
 
-        # Get final target dimensions (redundant if assigned above, but safe)
+        # Get final target dimensions
         tar_width, tar_height = resized_frames_ori[0].size
         print(f"--- Final processing dimensions: {tar_width}x{tar_height} ---")
 
@@ -376,48 +271,7 @@ class DiffuEraser:
             print(f"--- Using generator with seed: {seed} ---")
 
         ################  Prepare Priori Latents (Streamed VAE Encoding) ################
-        latents_list = []
-        num_vae_batch = 8 # Adjust based on VRAM
-        vae_module = self.pipeline.vae
-
-        print(f"--- Starting VAE encoding for {len(prioris)} priori frames in batches of {num_vae_batch} ---")
-        vae_original_device = vae_module.device
-
-        try:
-            vae_module.to(self.device)
-            print(f"--- Moved VAE to {self.device} for encoding ---")
-            wanted_dtype = torch.float32 if self.device==torch.device("cpu") else torch.float16
-
-            with torch.no_grad():
-                for i in range(0, len(prioris), num_vae_batch):
-                    batch_pil = prioris[i : i + num_vae_batch]
-                    current_batch_size = len(batch_pil)
-                    batch_tensor = [self.image_processor.preprocess(img, height=tar_height, width=tar_width).to(dtype=torch.float32) for img in batch_pil]
-                    batch_tensor = torch.cat(batch_tensor).to(device=self.device, dtype=wanted_dtype)
-
-                    batch_latents = vae_module.encode(batch_tensor).latent_dist.sample()
-                    latents_list.append(batch_latents.cpu())
-
-                    if i % (num_vae_batch * 10) == 0:
-                         end_frame_index = i + current_batch_size
-                         print(f"--- VAE encoded batch up to frame {end_frame_index} ---")
-
-                    del batch_pil, batch_tensor, batch_latents
-
-            latents = torch.cat(latents_list, dim=0)
-            print(f"--- VAE Encoding complete, created latents tensor shape: {latents.shape} on CPU ---")
-            del latents_list
-            gc.collect()
-
-            latents = latents.to(self.device)
-            latents = latents * vae_module.config.scaling_factor
-            print(f"--- Moved full latents tensor to {self.device} ---")
-
-        finally:
-            vae_module.to(vae_original_device)
-            print(f"--- Returned VAE to {vae_original_device} ---")
-            torch.cuda.empty_cache()
-            gc.collect()
+        latents = self._encode_prioris_to_latents(prioris, tar_height, tar_width)
 
         ################ Determine Noise Dtype ################
         if hasattr(self.pipeline, 'text_encoder') and self.pipeline.text_encoder is not None:
@@ -428,7 +282,7 @@ class DiffuEraser:
             prompt_embeds_dtype = torch.float32 if self.device==torch.device("cpu") else torch.float16 # Default fallback
 
         ################ Prepare Noise and Run Pre-inference ################
-        # Call the new helper method
+        # Call the helper method
         noise, timesteps_add_noise = self._prepare_noise_and_run_pre_inference(
             nframes=nframes,
             real_video_length=real_video_length,
@@ -497,8 +351,176 @@ class DiffuEraser:
         torch.cuda.empty_cache()
 
         ################ Compose Final Video ################
+        del validation_images_input, validation_masks_input
+        gc.collect()
+
+        result = self._compose_and_write_output(
+            images, resized_frames_ori, validation_masks_input_ori,
+            blended, fps, output_path, save_mode, validation_image)
+        return result
+
+
+    def _read_video_and_process_masks(self, validation_image, validation_mask,
+                                       max_video_length, mask_dilation_iter):
+        """Read input video, read mask (video or image), dilate masks, create masked images."""
+        ############### read input video ################
+        print(f"--- Reading video: {validation_image} using FFmpeg ---")
+        frames_pil, fps, img_size, color_info, n_total_frames = read_frames_high_fidelity_ffmpeg(
+            video_path=validation_image,
+            max_length=max_video_length if max_video_length > 0 else 99999.0,
+        )
+        if not frames_pil:
+            raise ValueError("FFmpeg reader returned no frames.")
+        frames = frames_pil
+        video_len = len(frames)
+        print(f"--- Video read: {video_len} frames, FPS: {fps}, Size: {img_size} ---")
+
+        ################     read mask    ################
+        print(f"--- Reading mask: {validation_mask} ---")
+        mask_is_video = validation_mask.lower().endswith(('.mp4', '.mov', '.avi'))
+
+        if mask_is_video:
+            print("--- Mask is video, reading with FFmpeg ---")
+            mask_frames_pil, mask_fps, mask_size, _, mask_frames_read = read_frames_high_fidelity_ffmpeg(
+                video_path=validation_mask,
+                max_length=max_video_length if max_video_length > 0 else 99999.0,
+            )
+            if not mask_frames_pil:
+                raise ValueError("FFmpeg mask reader returned no frames.")
+            if abs(mask_fps - fps) > 0.1:
+                print(f"Warning: Mask FPS {mask_fps} differs significantly from video FPS {fps}.")
+            if mask_size != img_size:
+                print(f"Warning: Mask size {mask_size} differs from video size {img_size}. Resizing mask.")
+            if mask_frames_read < video_len:
+                print(f"Warning: Mask video has fewer frames ({mask_frames_read}) than video ({video_len}).")
+            mask_frames_pil = mask_frames_pil[:video_len]
+        else:
+            print("--- Mask is image, reading with PIL ---")
+            mask_img = Image.open(validation_mask)
+            mask_frames_pil = [mask_img] * video_len
+
+        # Process mask frames (dilation, create masked images)
+        print(f"--- Processing {len(mask_frames_pil)} mask frames (dilation, creating masked images) ---")
+        validation_masks_input = []
+        validation_images_input = []
+        for i in range(video_len):
+            if i >= len(mask_frames_pil):
+                print(f"Warning: Ran out of mask frames at index {i}. Using last available mask.")
+                mask_pil = mask_frames_pil[-1]
+            else:
+                mask_pil = mask_frames_pil[i]
+
+            # Resize mask to match video frame size
+            if mask_pil.size != img_size:
+                mask_pil = mask_pil.resize(img_size, Image.Resampling.NEAREST)
+
+            # Convert to grayscale and NumPy
+            mask_np = np.array(mask_pil.convert('L'))
+
+            # Perform dilation
+            m = np.array(mask_np > 0).astype(np.uint8)
+
+            # --- Dilation step ---
+            if mask_dilation_iter > 0:
+                m = cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=mask_dilation_iter)
+
+            # Store dilated mask as PIL Image
+            dilated_mask_pil = Image.fromarray(m * 255)
+            validation_masks_input.append(dilated_mask_pil)
+
+            # Create masked image (using the correctly read `frames`)
+            frame_np = np.array(frames[i])
+            mask_for_apply = np.expand_dims(m, axis=2) # Shape (H, W, 1), values 0 or 1
+            masked_image_np = frame_np * (1 - mask_for_apply) # Apply mask (0 keeps original, 1 makes black)
+            masked_image_pil = Image.fromarray(masked_image_np.astype(np.uint8))
+            validation_images_input.append(masked_image_pil)
+
+        del mask_frames_pil
+        gc.collect()
+        print(f"--- Mask processing complete: {len(validation_masks_input)} masks, {len(validation_images_input)} masked images ---")
+
+        return frames, validation_masks_input, validation_images_input, fps, img_size, video_len
+
+
+
+    def _read_priori(self, priori_path, fps, img_size, video_len):
+        """Read priori video, check consistency, remove intermediate file, return frames + updated length."""
+        print(f"--- Reading priori: {priori_path} using FFmpeg ---")
+        priori_frames_pil, priori_fps, priori_size, _, priori_frames_read = read_frames_high_fidelity_ffmpeg(
+            video_path=priori_path,
+            max_length=0,
+        )
+        if not priori_frames_pil:
+            raise ValueError("FFmpeg priori reader returned no frames.")
+
+        if abs(priori_fps - fps) > 0.1:
+            print(f"Warning: Priori FPS {priori_fps} differs from video FPS {fps}.")
+        if priori_size != img_size:
+            print(f"Warning: Priori size {priori_size} differs from video size {img_size}. Priori frames will be used as is.")
+        if priori_frames_read != video_len:
+            print(f"Warning: Priori frames read ({priori_frames_read}) differs from video length ({video_len}). Using {priori_frames_read} frames.")
+
+        video_len = min(video_len, priori_frames_read)
+
+        os.remove(priori_path) # Keep removal of the intermediate file
+        print(f"--- Priori read: {len(priori_frames_pil)} frames ---")
+
+        return priori_frames_pil, video_len
+
+
+    def _encode_prioris_to_latents(self, prioris, tar_height, tar_width):
+        """Batch-encode priori PIL frames through VAE, return scaled latents on self.device."""
+        latents_list = []
+        num_vae_batch = 8
+        vae_module = self.pipeline.vae
+
+        print(f"--- Starting VAE encoding for {len(prioris)} priori frames in batches of {num_vae_batch} ---")
+        vae_original_device = vae_module.device
+
+        try:
+            vae_module.to(self.device)
+            print(f"--- Moved VAE to {self.device} for encoding ---")
+            wanted_dtype = torch.float32 if self.device == torch.device("cpu") else torch.float16
+
+            with torch.no_grad():
+                for i in range(0, len(prioris), num_vae_batch):
+                    batch_pil = prioris[i : i + num_vae_batch]
+                    current_batch_size = len(batch_pil)
+                    batch_tensor = [self.image_processor.preprocess(img, height=tar_height, width=tar_width).to(dtype=torch.float32) for img in batch_pil]
+                    batch_tensor = torch.cat(batch_tensor).to(device=self.device, dtype=wanted_dtype)
+
+                    batch_latents = vae_module.encode(batch_tensor).latent_dist.sample()
+                    latents_list.append(batch_latents.cpu())
+
+                    if i % (num_vae_batch * 10) == 0:
+                         end_frame_index = i + current_batch_size
+                         print(f"--- VAE encoded batch up to frame {end_frame_index} ---")
+
+                    del batch_pil, batch_tensor, batch_latents
+
+            latents = torch.cat(latents_list, dim=0)
+            print(f"--- VAE Encoding complete, created latents tensor shape: {latents.shape} on CPU ---")
+            del latents_list
+            gc.collect()
+
+            latents = latents.to(self.device)
+            latents = latents * vae_module.config.scaling_factor
+            print(f"--- Moved full latents tensor to {self.device} ---")
+
+        finally:
+            vae_module.to(vae_original_device)
+            print(f"--- Returned VAE to {vae_original_device} ---")
+            torch.cuda.empty_cache()
+            gc.collect()
+
+        return latents
+            
+
+    def _compose_and_write_output(self, images, original_frames, original_masks,
+                                   blended, fps, output_path, save_mode, source_video_path):
+        """Blend generated frames with originals using masks, write final video."""
         print(f"--- Composing final video using original masks and frames ---")
-        binary_masks = validation_masks_input_ori # Use the original masks read from file
+        binary_masks = original_masks
         mask_blurreds = []
         if blended:
             print(f"--- Applying blur blending to masks ---")
@@ -508,30 +530,27 @@ class DiffuEraser:
                 mask_blurred_np = cv2.GaussianBlur(mask_np, (21, 21), 0) / 255.0
                 binary_mask_np = 1.0 - (1.0 - mask_np / 255.0) * (1.0 - mask_blurred_np)
                 mask_blurreds.append(Image.fromarray((binary_mask_np * 255).astype(np.uint8)))
-            binary_masks = mask_blurreds # Use the blurred versions for composition
+            binary_masks = mask_blurreds
 
         comp_frames = []
-        frames_for_composition = resized_frames_ori # Use the original resized frames
         print(f"--- Composing {len(images)} generated frames with original frames ---")
         for i in range(len(images)):
-            if i >= len(frames_for_composition) or i >= len(binary_masks):
+            if i >= len(original_frames) or i >= len(binary_masks):
                 print(f"Warning: Skipping composition for frame {i} due to list length mismatch.")
-                continue # Skip if lists are somehow shorter than generated images
+                continue
 
             mask_np = np.expand_dims(np.array(binary_masks[i]), axis=2) / 255.0
             img_generated_np = np.array(images[i]).astype(np.uint8)
-            img_original_np = np.array(frames_for_composition[i]).astype(np.uint8)
+            img_original_np = np.array(original_frames[i]).astype(np.uint8)
 
             img_comp_np = (img_generated_np * mask_np + img_original_np * (1.0 - mask_np)).astype(np.uint8)
             comp_frames.append(Image.fromarray(img_comp_np))
 
-        del images, frames_for_composition, binary_masks, mask_blurreds # Free memory
-        if 'validation_images_input' in locals(): del validation_images_input
-        if 'validation_masks_input' in locals(): del validation_masks_input
+        del images, original_frames, binary_masks, mask_blurreds
         gc.collect()
 
         ################ Write Video ################
-        print(f"--- Writing final video (Mode: {save_mode}) to: {output_path} using FFmpeg ---") # Log the mode
+        print(f"--- Writing final video (Mode: {save_mode}) to: {output_path} using FFmpeg ---")
         if not comp_frames:
              print("Error: No frames to write to video!")
              return None
@@ -542,23 +561,23 @@ class DiffuEraser:
                 frames_list=frames_np_list,
                 output_path=output_path,
                 fps=fps,
-                size=frames_np_list[0].shape[1::-1], # Get (width, height) from np array
-                original_video_path=validation_image, # Pass original crop for YUV tag probing if using YUV save_mode
+                size=frames_np_list[0].shape[1::-1],
+                original_video_path=source_video_path, # For YUV tag probing if using YUV save_mode
                 save_mode=save_mode
             )
             print(f"--- Video writing complete (Mode: {save_mode}) ---")
         except Exception as e:
              print(f"ERROR during FFmpeg video saving in DiffuEraser: {e}")
-             # Handle error, maybe try to delete partial output file
              if os.path.exists(output_path):
                  try: os.remove(output_path)
                  except OSError: pass
-             return None # Indicate failure
+             return None
 
-        del frames_np_list# Cleanup intermediate NumPy list if large
+        del frames_np_list
         gc.collect()
         return output_path
-            
+
+
 
     def _prepare_noise_and_run_pre_inference(
         self, nframes, real_video_length, tar_height, tar_width, prompt_embeds_dtype,
@@ -618,97 +637,21 @@ class DiffuEraser:
         # Condition uses the actual nframes value
         if real_video_length > nframes * 2:
             print(f"--- Running Pre-inference using nframes={nframes} on sampled frames ---")
-            ## Sample indices based on nframes
-            step = real_video_length / nframes # Use real_video_length for sampling step
-            num_samples = min(nframes, real_video_length) # Ensure we don't sample more indices than available frames or the desired nframes
-            sample_index = [int(i * step) for i in range(num_samples)]
-            sample_index = [idx for idx in sample_index if idx < real_video_length] # Ensure indices are within bounds
-            num_samples = len(sample_index) # Update num_samples after bounds check
+            step = real_video_length / nframes
+            sample_index = [int(i * step) for i in range(nframes)]
+            sample_index = [idx for idx in sample_index if idx < real_video_length]
 
-            if num_samples == 0: # Handle edge case where sampling yields no indices
-                print("--- Pre-inference sampling resulted in 0 frames. Skipping pre-inference. ---")
-                latents_pre = None
-            elif latents.shape[0] > max(sample_index): # Safely gather latents for sampled indices
-                 print(f"--- Sampled {num_samples} indices for pre-inference: {sample_index[:10]}... ---") # Print first 10
-                 latents_pre = torch.stack([latents[i] for i in sample_index])
-                 # Gather corresponding inputs
-                 validation_masks_input_pre = [validation_masks_input[i] for i in sample_index]
-                 validation_images_input_pre = [validation_images_input[i] for i in sample_index]
+            if sample_index and latents.shape[0] > max(sample_index):
+                self._run_pre_inference(
+                    latents, sample_index, noise_pre,
+                    validation_masks_input, validation_images_input,
+                    validation_prompt, guidance_scale_final, generator)
             else:
-                 print(f"ERROR: Not enough latents ({latents.shape[0]}) generated for pre-inference sampling (max index: {max(sample_index)}). Skipping pre-inference.")
-                 latents_pre = None # Indicate failure/skip
-
-            if latents_pre is not None: # Only proceed if latents were sampled correctly
-                # Ensure noise_pre matches the number of frames being processed (num_samples)
-                if noise_pre.shape[0] != num_samples:
-                     print(f"Warning: Adjusting noise_pre shape from {noise_pre.shape[0]} to {num_samples} for pre-inference")
-                     noise_pre_adjusted = noise_pre[:num_samples].clone() # Use clone to avoid modifying original noise_pre if needed elsewhere (though likely not here)
-                else:
-                     noise_pre_adjusted = noise_pre
-
-                ## Add noise using the sampled latents and adjusted noise
-                noisy_latents_pre = self.noise_scheduler.add_noise(latents_pre, noise_pre_adjusted, timesteps_add_noise)
-                latents_pre_input = noisy_latents_pre # Use noisy latents as input to pipeline
-
-                # Run the pipeline on the sampled subset
-                print(f"--- Calling pipeline for pre-inference ({num_samples} frames) ---")
-                with torch.no_grad():
-                    # Pass the actual number of frames being processed
-                    pipeline_output = self.pipeline(
-                        num_frames=num_samples,
-                        prompt=validation_prompt,
-                        images=validation_images_input_pre,
-                        masks=validation_masks_input_pre,
-                        num_inference_steps=self.num_inference_steps,
-                        generator=generator,
-                        guidance_scale=guidance_scale_final,
-                        latents=latents_pre_input, # Start from noisy latents
-                        output_type="latent" # Get latents directly
-                    )
-                    # Check output format
-                    if isinstance(pipeline_output, dict) and 'latents' in pipeline_output:
-                         latents_pre_out = pipeline_output.latents
-                    elif isinstance(pipeline_output, DiffuEraserPipelineOutput):
-                         latents_pre_out = pipeline_output.latents
-                    else:
-                         latents_pre_out = pipeline_output # Assume direct output
-                         print("Warning: Pre-inference pipeline output format unexpected, assuming latents tensor.")
-
-                print(f"--- Pre-inference pipeline call complete ---")
-                torch.cuda.empty_cache()
-                del latents_pre_input, noisy_latents_pre, noise_pre_adjusted # Clean up intermediate tensors
-
-                # Update main latents tensor with pre-inference results
-                if latents_pre_out is not None and latents_pre_out.shape[0] == num_samples:
-                    print(f"--- Updating main latents tensor with {num_samples} pre-inference results ---")
-                    for i, index in enumerate(sample_index):
-                        if i < latents_pre_out.shape[0] and index < latents.shape[0]:
-                            # Update latents (move pre-inf latent back to GPU if needed, already on device from pipeline)
-                            latents[index] = latents_pre_out[i] # Modify the input 'latents' tensor
-                        else:
-                            print(f"Warning: Index mismatch during pre-inference LATENT update (i={i}, index={index}). Skipping update for this index.")
-                    del latents_pre_out # Free memory
-                    torch.cuda.empty_cache()
-                else: # If latents_pre_out was None or shape mismatch
-                     print("--- Skipping pre-inference result application due to missing/mismatched latents_pre_out ---")
-                     if latents_pre_out is not None: del latents_pre_out # Clean up if exists
-                     latents_pre_out = None # Ensure it's None for logic flow
-
-            else: # latents_pre was None (sampling failed or error)
-                 print("--- Skipping pre-inference pipeline call due to sampling issues or condition not met ---")
-                 latents_pre_out = None # Ensure it's None
-
-        else: # real_video_length <= nframes * 2
+                print(f"--- Skipping pre-inference: no valid sample indices ---")
+        else:
             print("--- Skipping Pre-inference step (video too short or condition not met) ---")
-            latents_pre_out = None # Ensure variable exists but is None
-            sample_index = None
 
-        # Final cleanup before returning
-        del noise_pre # Base noise pattern is no longer needed outside this scope
-        if 'latents_pre_out' in locals() and latents_pre_out is not None:
-            del latents_pre_out # Should have been deleted earlier, but just in case
-        if 'latents_pre' in locals() and latents_pre is not None:
-            del latents_pre # Sampled latents before noise addition
+        del noise_pre
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -716,4 +659,58 @@ class DiffuEraser:
         # The 'latents' tensor passed as input has been modified in-place if pre-inference ran.
         return noise, timesteps_add_noise
 
+
+
+    def _run_pre_inference(self, latents, sample_index, noise_pre,
+                           validation_masks_input, validation_images_input,
+                           validation_prompt, guidance_scale_final, generator):
+        """Run pipeline on a sampled subset of frames, update latents in-place."""
+        num_samples = len(sample_index)
+        print(f"--- Sampled {num_samples} indices for pre-inference: {sample_index[:10]}... ---")
+
+        latents_pre = torch.stack([latents[i] for i in sample_index])
+        validation_masks_input_pre = [validation_masks_input[i] for i in sample_index]
+        validation_images_input_pre = [validation_images_input[i] for i in sample_index]
+
+        # Ensure noise_pre matches the number of sampled frames
+        if noise_pre.shape[0] != num_samples:
+            print(f"Warning: Adjusting noise_pre shape from {noise_pre.shape[0]} to {num_samples} for pre-inference")
+            noise_pre_adjusted = noise_pre[:num_samples].clone()
+        else:
+            noise_pre_adjusted = noise_pre
+
+        timesteps_pre = torch.tensor([0], device=self.device).long()
+        noisy_latents_pre = self.noise_scheduler.add_noise(latents_pre, noise_pre_adjusted, timesteps_pre)
+        del latents_pre
+
+        print(f"--- Calling pipeline for pre-inference ({num_samples} frames) ---")
+        with torch.no_grad():
+            pipeline_output = self.pipeline(
+                num_frames=num_samples,
+                prompt=validation_prompt,
+                images=validation_images_input_pre,
+                masks=validation_masks_input_pre,
+                num_inference_steps=self.num_inference_steps,
+                generator=generator,
+                guidance_scale=guidance_scale_final,
+                latents=noisy_latents_pre,
+                output_type="latent"
+            )
+            if isinstance(pipeline_output, DiffuEraserPipelineOutput):
+                latents_pre_out = pipeline_output.latents
+            else:
+                latents_pre_out = pipeline_output
+                print("Warning: Pre-inference pipeline output format unexpected, assuming latents tensor.")
+
+        print(f"--- Pre-inference pipeline call complete ---")
+        del noisy_latents_pre, noise_pre_adjusted
+        torch.cuda.empty_cache()
+
+        # Update main latents tensor with pre-inference results
+        print(f"--- Updating main latents tensor with {num_samples} pre-inference results ---")
+        for i, index in enumerate(sample_index):
+            latents[index] = latents_pre_out[i]
+
+        del latents_pre_out
+        torch.cuda.empty_cache()
 
