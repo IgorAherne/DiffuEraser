@@ -1575,6 +1575,13 @@ class StableDiffusionDiffuEraserPipeline(
             mid_block_res_sample = torch.cat([torch.zeros_like(mid_block_res_sample), mid_block_res_sample])
             up_block_res_samples = [torch.cat([torch.zeros_like(d), d]) for d in up_block_res_samples]
 
+        # Offload BrushNet residuals to CPU so the GPU can be defragmented
+        # before UNet runs. They'll be moved back just before the UNet call.
+        down_block_res_samples = [d.to(cpu_device) for d in down_block_res_samples]
+        mid_block_res_sample = mid_block_res_sample.to(cpu_device)
+        up_block_res_samples = [u.to(cpu_device) for u in up_block_res_samples]
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
+
         # --- UNet Inference ---
         self.unet.to(unet_device)
         print(f"[t={t_val}, j={j}] Running UNet on {unet_device}...")
@@ -1583,10 +1590,11 @@ class StableDiffusionDiffuEraserPipeline(
         unet_prompt_embeds_gpu = original_prompt_embeds.to(unet_device)
         timestep_cond_gpu = timestep_cond.to(unet_device) if timestep_cond is not None else None
 
-        # Assign BrushNet results (already on GPU) directly for UNet input
-        down_block_add_samples_unet = down_block_res_samples
-        mid_block_add_sample_unet = mid_block_res_sample
-        up_block_add_samples_unet = up_block_res_samples
+        # Move BrushNet residuals back to GPU for UNet consumption
+        down_block_add_samples_unet = [d.to(unet_device) for d in down_block_res_samples]
+        mid_block_add_sample_unet = mid_block_res_sample.to(unet_device)
+        up_block_add_samples_unet = [u.to(unet_device) for u in up_block_res_samples]
+        del down_block_res_samples, mid_block_res_sample, up_block_res_samples
 
         # Clear cache here (Brush net causes a large vram growth)
         if torch.cuda.is_available(): torch.cuda.empty_cache()
